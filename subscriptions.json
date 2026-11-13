@@ -1,0 +1,33 @@
+{
+  "1589200303": [],
+  "1372602257": [
+    {
+      "route": "9",
+      "dir_id": "1",
+      "stop_idx": 10,
+      "remind_before": 15,
+      "active": true
+    },
+    {
+      "route": "6",
+      "dir_id": "1",
+      "stop_idx": 2,
+      "remind_before": 15,
+      "active": true
+    },
+    {
+      "route": "3",
+      "dir_id": "1",
+      "stop_idx": 12,
+      "remind_before": 15,
+      "active": true
+    },
+    {
+      "route": "7",
+      "dir_id": "1",
+      "stop_idx": 2,
+      "remind_before": 15,
+      "active": true
+    }
+  ]
+}
