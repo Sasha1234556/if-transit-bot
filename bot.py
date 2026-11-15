@@ -270,7 +270,6 @@ async def save_subscription(callback: types.CallbackQuery):
     direction = schedules[dict_key][int(dir_id)]
     stop = direction["stops"][int(stop_idx)]
 
-    # Вираховуємо найближчий рейс прямо зараз
     next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
     time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min,
                                                                                                  int) else f"🕒 Найближчий рейс: {next_time}"
@@ -293,7 +292,7 @@ async def save_subscription(callback: types.CallbackQuery):
         f"{icon} Маршрут №{route_num}\n"
         f"📍 Зупинка: **{stop['name']}**\n"
         f"{time_info_str}\n"
-        f"⏰ Нагадування: за **{remind_before} хв** до прибуття.\n\n"
+        f"⏰ Нагадування: за **{remind_before} хв** (+ буфер на дорогу) до прибуття.\n\n"
         f"Керувати збереженими маршрутами можна у меню «🔔 Мої зупинки».",
         parse_mode="Markdown",
     )
@@ -324,7 +323,6 @@ async def my_subscriptions(message: types.Message):
             status = "🟢 Увімкнено" if sub.get("active", True) else "⏸ На паузі"
             icon = "🚎" if prefix == "t" else "🚌"
 
-            # Отримуємо найближчий час прибуття для кожної збереженої зупинки
             next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
             live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min,
                                                                                        int) else f"{next_time}"
@@ -375,7 +373,7 @@ async def delete_sub(callback: types.CallbackQuery):
     await my_subscriptions(callback.message)
 
 
-# --- Фонова перевірка розкладу щохвилини ---
+# --- Фонова перевірка розкладу щохвилини (з буфером безпеки) ---
 async def check_schedules():
     now = datetime.now(KYIV_TZ)
     is_weekend = now.weekday() >= 5
@@ -393,7 +391,10 @@ async def check_schedules():
             route_data = schedules.get(dict_key, [])[int(sub["dir_id"])]
             stop_info = route_data["stops"][sub["stop_idx"]]
             offset = stop_info["offset"]
-            remind_before = sub["remind_before"]
+
+            # ДОДАЄМО БУФЕР БЕЗПЕКИ: +2 хвилини наперед, щоб ви точно встигали дойти
+            safety_buffer = 2
+            remind_before = sub["remind_before"] + safety_buffer
 
             for dep_str in route_data.get(day_key, []):
                 hour, minute = map(int, dep_str.split(":"))
@@ -408,8 +409,9 @@ async def check_schedules():
                         await bot.send_message(
                             chat_id=int(user_id),
                             text=(
+                                f"⚠️ **Час виходити на зупинку!**\n"
                                 f"{icon} **Маршрут №{route_num}** буде на зупинці **{stop_info['name']}** "
-                                f"через **{remind_before} хв** (о **{arr_str}**)."
+                                f"приблизно о **{arr_str}** (з урахуванням запасу часу на дорогу)."
                             ),
                             parse_mode="Markdown",
                         )
