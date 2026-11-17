@@ -9,6 +9,9 @@ import requests
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -20,6 +23,13 @@ SUBS_FILE = "subscriptions.json"
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+
+class RemindState(StatesGroup):
+    waiting_minutes = State()
+
+MIN_REMIND = 1
+MAX_REMIND = 60
 
 # Словник для відстеження стану тривоги для користувачів
 user_alarm_status = {}
@@ -65,7 +75,8 @@ def main_menu_kb():
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "Привіт! Я бот розкладу тролейбусів та автобусів Івано-Франківська.\n"
         "Натисни **«🚎 Маршрути»**, скористайся кнопкою карти внизу або просто напиши назву своєї зупинки текстом, і я знайду її розклад!",
@@ -75,7 +86,8 @@ async def cmd_start(message: types.Message):
 
 
 @dp.message(F.text == "🗺 Онлайн-карта")
-async def open_map_links(message: types.Message):
+async def open_map_links(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "Оберіть сервіс для перегляду транспорту наживо або мапу тривог:",
         reply_markup=map_keyboard
@@ -147,7 +159,8 @@ def get_next_arrival_info(dict_key, dir_id, stop_idx):
 
 # 1. Головна кнопка «Маршрути»
 @dp.message(F.text == "🚎 Маршрути")
-async def choose_transport_type(message: types.Message):
+async def choose_transport_type(message: types.Message, state: FSMContext):
+    await state.clear()
     buttons = [
         [
             InlineKeyboardButton(text="🚎 Тролейбуси", callback_data="type:trolley"),
@@ -237,6 +250,30 @@ async def choose_stop(callback: types.CallbackQuery):
     )
 
 
+@dp.message(RemindState.waiting_minutes, F.text)
+async def receive_custom_time(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+
+    # Якщо це не число (наприклад, назва зупинки чи команда) — виходимо зі стану
+    # і віддаємо повідомлення далі, на звичайний пошук зупинки
+    if not (text.isascii() and text.isdigit()):
+        await state.clear()
+        raise SkipHandler
+
+    minutes = int(text)
+    if not (MIN_REMIND <= minutes <= MAX_REMIND):
+        await message.answer(f"❌ Введіть число від {MIN_REMIND} до {MAX_REMIND}.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    result = add_subscription(
+        str(message.from_user.id),
+        data["prefix"], data["route_num"], data["dir_id"], data["stop_idx"], minutes,
+    )
+    await message.answer(result, parse_mode="Markdown")
+
+
 @dp.message(F.text & ~F.text.in_(["🚎 Маршрути", "🔔 Мої зупинки", "🗺 Онлайн-карта"]))
 async def search_stop_by_text(message: types.Message):
     query = message.text.strip().lower()
@@ -280,7 +317,10 @@ async def choose_remind_time(callback: types.CallbackQuery):
             InlineKeyboardButton(text="За 5 хв", callback_data=f"save:{prefix}:{route_num}:{dir_id}:{stop_idx}:5"),
             InlineKeyboardButton(text="За 10 хв", callback_data=f"save:{prefix}:{route_num}:{dir_id}:{stop_idx}:10"),
             InlineKeyboardButton(text="За 15 хв", callback_data=f"save:{prefix}:{route_num}:{dir_id}:{stop_idx}:15"),
-        ]
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Своє число (1–60)", callback_data=f"custom:{prefix}:{route_num}:{dir_id}:{stop_idx}"),
+        ],
     ]
     await callback.message.answer(
         "За скільки хвилин до прибуття на зупинку вас попереджати?",
@@ -289,11 +329,19 @@ async def choose_remind_time(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("save:"))
-async def save_subscription(callback: types.CallbackQuery):
-    _, prefix, route_num, dir_id, stop_idx, remind_before = callback.data.split(":")
-    user_id = str(callback.from_user.id)
+@dp.callback_query(F.data.startswith("custom:"))
+async def ask_custom_time(callback: types.CallbackQuery, state: FSMContext):
+    _, prefix, route_num, dir_id, stop_idx = callback.data.split(":")
+    await state.set_state(RemindState.waiting_minutes)
+    await state.update_data(prefix=prefix, route_num=route_num, dir_id=dir_id, stop_idx=stop_idx)
+    await callback.message.answer(
+        f"✏️ Введіть число хвилин від {MIN_REMIND} до {MAX_REMIND} — за скільки попереджати про прибуття:"
+    )
+    await callback.answer()
 
+
+def add_subscription(user_id, prefix, route_num, dir_id, stop_idx, remind_before):
+    """Зберігає підписку та повертає текст підтвердження."""
     dict_key = route_num if prefix == "t" else f"bus_{route_num}"
     direction = schedules[dict_key][int(dir_id)]
     stop = direction["stops"][int(stop_idx)]
@@ -302,32 +350,39 @@ async def save_subscription(callback: types.CallbackQuery):
     time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min, int) else f"🕒 Найближчий рейс: {next_time}"
 
     user_subs = subscriptions.setdefault(user_id, [])
-    new_sub = {
+    user_subs.append({
         "prefix": prefix,
         "route": route_num,
         "dir_id": dir_id,
         "stop_idx": int(stop_idx),
         "remind_before": int(remind_before),
         "active": True,
-    }
-    user_subs.append(new_sub)
+    })
     save_json(SUBS_FILE, subscriptions)
 
     icon = "🚎" if prefix == "t" else "🚌"
-    await callback.message.edit_text(
+    return (
         f"✅ **Збережено!**\n"
         f"{icon} Маршрут №{route_num}\n"
         f"📍 Зупинка: **{stop['name']}**\n"
         f"{time_info_str}\n"
         f"⏰ Нагадування: за **{remind_before} хв** (+ буфер на дорогу) до прибуття.\n\n"
-        f"Керувати збереженими маршрутами можна у меню «🔔 Мої зупинки».",
-        parse_mode="Markdown",
+        f"Керувати збереженими маршрутами можна у меню «🔔 Мої зупинки»."
     )
+
+
+@dp.callback_query(F.data.startswith("save:"))
+async def save_subscription(callback: types.CallbackQuery):
+    _, prefix, route_num, dir_id, stop_idx, remind_before = callback.data.split(":")
+    result = add_subscription(str(callback.from_user.id), prefix, route_num, dir_id, stop_idx, remind_before)
+    await callback.message.edit_text(result, parse_mode="Markdown")
 
 
 # --- Перегляд та керування збереженими зупинками ---
 @dp.message(F.text == "🔔 Мої зупинки")
-async def my_subscriptions(message: types.Message):
+async def my_subscriptions(message: types.Message, state: FSMContext = None):
+    if state is not None:
+        await state.clear()
     user_id = str(message.from_user.id)
     user_subs = subscriptions.get(user_id, [])
 
