@@ -17,30 +17,6 @@
       "active": true
     },
     {
-      "prefix": "t",
-      "route": "3",
-      "dir_id": "1",
-      "stop_idx": 12,
-      "remind_before": 5,
-      "active": true
-    },
-    {
-      "prefix": "b",
-      "route": "43",
-      "dir_id": "0",
-      "stop_idx": 0,
-      "remind_before": 5,
-      "active": true
-    },
-    {
-      "prefix": "b",
-      "route": "43",
-      "dir_id": "1",
-      "stop_idx": 7,
-      "remind_before": 5,
-      "active": true
-    },
-    {
       "prefix": "b",
       "route": "41",
       "dir_id": "1",
