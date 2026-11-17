@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 import pytz
+import requests
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
@@ -19,6 +20,11 @@ SUBS_FILE = "subscriptions.json"
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Словник для відстеження стану тривоги для користувачів
+user_alarm_status = {}
+# Час останнього відбою тривоги (для попередження про збитий графік)
+last_all_clear_time = None
 
 
 def load_json(filename, default):
@@ -36,11 +42,14 @@ def save_json(filename, data):
 schedules = load_json(SCHEDULES_FILE, {})
 subscriptions = load_json(SUBS_FILE, {})
 
-# Клавіатура з посиланнями на живі карти Івано-Франківська
+# Клавіатура з посиланнями на живі карти Івано-Франківська та мапу тривог
 map_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="🗺 DozoR (Карта)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
         InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+    ],
+    [
+        InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")
     ]
 ])
 
@@ -68,9 +77,24 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "🗺 Онлайн-карта")
 async def open_map_links(message: types.Message):
     await message.answer(
-        "Оберіть сервіс для перегляду транспорту наживо:",
+        "Оберіть сервіс для перегляду транспорту наживо або мапу тривог:",
         reply_markup=map_keyboard
     )
+
+
+# Функція перевірки повітряної тривоги в Івано-Франківську
+def check_ivano_frankivsk_alarm():
+    try:
+        resp = requests.get("https://alerts.in.ua/api/v1/alerts", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get("states", []):
+                if "івано-франк" in item.get("location_title", "").lower():
+                    if item.get("alert_type") == "air_raid" and not item.get("finished_at"):
+                        return True
+    except Exception as e:
+        logging.error(f"Помилка перевірки тривоги: {e}")
+    return False
 
 
 # Допоміжна функція для пошуку найближчого часу прибуття на зупинку
@@ -110,7 +134,6 @@ def get_next_arrival_info(dict_key, dir_id, stop_idx):
             next_arrival_str = f"{arr_h:02d}:{arr_m:02d}"
             break
 
-    # Якщо на сьогодні рейси скінчилися, беремо перший рейс наступного дня
     if next_arrival_str is None and dep_list:
         h, m = map(int, dep_list[0].split(":"))
         arr_total_min = h * 60 + m + offset
@@ -198,9 +221,14 @@ async def choose_stop(callback: types.CallbackQuery):
             )
         ])
 
-    buttons.append([
-        InlineKeyboardButton(text="🗺 DozoR", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
-        InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+    buttons.extend([
+        [
+            InlineKeyboardButton(text="🗺 DozoR", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+            InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+        ],
+        [
+            InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")
+        ]
     ])
 
     await callback.message.edit_text(
@@ -271,8 +299,7 @@ async def save_subscription(callback: types.CallbackQuery):
     stop = direction["stops"][int(stop_idx)]
 
     next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
-    time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min,
-                                                                                                 int) else f"🕒 Найближчий рейс: {next_time}"
+    time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min, int) else f"🕒 Найближчий рейс: {next_time}"
 
     user_subs = subscriptions.setdefault(user_id, [])
     new_sub = {
@@ -324,8 +351,7 @@ async def my_subscriptions(message: types.Message):
             icon = "🚎" if prefix == "t" else "🚌"
 
             next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
-            live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min,
-                                                                                       int) else f"{next_time}"
+            live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
 
             text += (
                 f"{idx + 1}. {icon} Маршрут №{route_num} — {stop['name']}\n"
@@ -338,9 +364,14 @@ async def my_subscriptions(message: types.Message):
                 InlineKeyboardButton(text=f"🗑 Видалити #{idx + 1}", callback_data=f"del:{idx}"),
             ])
 
-        buttons.append([
-            InlineKeyboardButton(text="🗺 DozoR (Карта)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
-            InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+        buttons.extend([
+            [
+                InlineKeyboardButton(text="🗺 DozoR (Карта)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+            ],
+            [
+                InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")
+            ]
         ])
 
         await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
@@ -373,9 +404,70 @@ async def delete_sub(callback: types.CallbackQuery):
     await my_subscriptions(callback.message)
 
 
-# --- Фонова перевірка розкладу щохвилини (з буфером безпеки) ---
+# --- Фонова перевірка розкладу щохвилини (з урахуванням тривоги та відбою) ---
 async def check_schedules():
+    global last_all_clear_time
     now = datetime.now(KYIV_TZ)
+
+    # Перевіряємо чи є зараз повітряна тривога в Івано-Франківську
+    is_alarm = check_ivano_frankivsk_alarm()
+
+    for user_id in subscriptions.keys():
+        current_alarm_state = user_alarm_status.get(user_id, False)
+
+        if is_alarm:
+            if not current_alarm_state:
+                user_alarm_status[user_id] = True
+                try:
+                    alarm_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")]
+                    ])
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            "🔴 **Увага! В місті Івано-Франківськ повітряна тривога (червоний рівень небезпеки).**\n"
+                            "Транспорт тимчасово не курсує до відбою. Сповіщення про прибуття зупинено."
+                        ),
+                        reply_markup=alarm_kb,
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logging.error(f"Не вдалося надіслати сповіщення про тривогу {user_id}: {e}")
+            continue
+        else:
+            if current_alarm_state:
+                user_alarm_status[user_id] = False
+                last_all_clear_time = now
+                try:
+                    live_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="🗺 DozoR (Наживо)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                            InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+                        ]
+                    ])
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            "🟢 **Відбій повітряної тривоги!**\n"
+                            "⚠️ Зверніть увагу: після тривоги графіки руху тимчасово збиті. "
+                            "Транспорт може відхилятися від розкладу (прибувати пізніше або раніше). "
+                            "Рекомендуємо звірятися з онлайн-картою:"
+                        ),
+                        reply_markup=live_kb,
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logging.error(f"Не вдалося надіслати сповіщення про відбій {user_id}: {e}")
+
+    if is_alarm:
+        return
+
+    # Перевіряємо, чи не минуло менше 60 хвилин після останнього відбою
+    is_post_alarm = (
+        last_all_clear_time is not None
+        and (now - last_all_clear_time) < timedelta(hours=1)
+    )
+
     is_weekend = now.weekday() >= 5
     day_key = "weekends" if is_weekend else "workdays"
 
@@ -392,7 +484,7 @@ async def check_schedules():
             stop_info = route_data["stops"][sub["stop_idx"]]
             offset = stop_info["offset"]
 
-            # ДОДАЄМО БУФЕР БЕЗПЕКИ: +2 хвилини наперед, щоб ви точно встигали дойти
+            # Буфер безпеки: +2 хвилини наперед
             safety_buffer = 2
             remind_before = sub["remind_before"] + safety_buffer
 
@@ -405,14 +497,32 @@ async def check_schedules():
                 if now.hour == notify_time.hour and now.minute == notify_time.minute:
                     arr_str = arrival_time.strftime("%H:%M")
                     icon = "🚎" if prefix == "t" else "🚌"
+
+                    msg_text = (
+                        f"⚠️ **Час виходити на зупинку!**\n"
+                        f"{icon} **Маршрут №{route_num}** буде на зупинці **{stop_info['name']}** "
+                        f"приблизно о **{arr_str}** (з урахуванням запасу часу на дорогу)."
+                    )
+                    reply_kb = None
+
+                    # Якщо протягом останньої години був відбій — додаємо попередження про збитий графік
+                    if is_post_alarm:
+                        msg_text += (
+                            "\n\n🚨 *Увага: через нещодавню тривогу графік може бути зміщений "
+                            "(транспорт може прибути раніше або пізніше). Перевірте GPS на карті:*"
+                        )
+                        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [
+                                InlineKeyboardButton(text="🗺 DozoR", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                                InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+                            ]
+                        ])
+
                     try:
                         await bot.send_message(
                             chat_id=int(user_id),
-                            text=(
-                                f"⚠️ **Час виходити на зупинку!**\n"
-                                f"{icon} **Маршрут №{route_num}** буде на зупинці **{stop_info['name']}** "
-                                f"приблизно о **{arr_str}** (з урахуванням запасу часу на дорогу)."
-                            ),
+                            text=msg_text,
+                            reply_markup=reply_kb,
                             parse_mode="Markdown",
                         )
                     except Exception as e:
