@@ -10,8 +10,6 @@ import requests
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN = "6241822896:AAHs62SrJ6RgLv58QXqvf32AQWSNRUyWXlw"
@@ -27,11 +25,6 @@ dp = Dispatcher()
 user_alarm_status = {}
 # Час останнього відбою тривоги (для попередження про збитий графік)
 last_all_clear_time = None
-
-
-# Стан для введення користувацького часу нагадування
-class ReminderState(StatesGroup):
-    waiting_for_minutes = State()
 
 
 def load_json(filename, default):
@@ -245,12 +238,7 @@ async def choose_stop(callback: types.CallbackQuery):
 
 
 @dp.message(F.text & ~F.text.in_(["🚎 Маршрути", "🔔 Мої зупинки", "🗺 Онлайн-карта"]))
-async def search_stop_by_text(message: types.Message, state: FSMContext):
-    # Якщо бот чекає введення хвилин, не запускаємо пошук зупинки
-    current_state = await state.get_state()
-    if current_state == ReminderState.waiting_for_minutes.state:
-        return
-
+async def search_stop_by_text(message: types.Message):
     query = message.text.strip().lower()
     found = []
 
@@ -285,88 +273,55 @@ async def search_stop_by_text(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query(F.data.startswith("stop:"))
-async def ask_remind_time(callback: types.CallbackQuery, state: FSMContext):
+async def choose_remind_time(callback: types.CallbackQuery):
     _, prefix, route_num, dir_id, stop_idx = callback.data.split(":")
-
-    # Зберігаємо тимчасові дані підписки у стані FSM
-    await state.update_data(
-        prefix=prefix,
-        route=route_num,
-        dir_id=dir_id,
-        stop_idx=int(stop_idx)
-    )
-
-    # Встановлюємо стан очікування числа від користувача
-    await state.set_state(ReminderState.waiting_for_minutes)
-
+    buttons = [
+        [
+            InlineKeyboardButton(text="За 5 хв", callback_data=f"save:{prefix}:{route_num}:{dir_id}:{stop_idx}:5"),
+            InlineKeyboardButton(text="За 10 хв", callback_data=f"save:{prefix}:{route_num}:{dir_id}:{stop_idx}:10"),
+            InlineKeyboardButton(text="За 15 хв", callback_data=f"save:{prefix}:{route_num}:{dir_id}:{stop_idx}:15"),
+        ]
+    ]
     await callback.message.answer(
-        "⏱ **Введіть кількість хвилин** (від 1 до 60), за скільки до прибуття транспорту вас попереджати?\n"
-        "(Просто напишіть число у чат, наприклад: `5` або `10`)",
-        parse_mode="Markdown"
+        "За скільки хвилин до прибуття на зупинку вас попереджати?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
 
 
-@dp.message(ReminderState.waiting_for_minutes)
-async def save_custom_subscription(message: types.Message, state: FSMContext):
-    text = message.text.strip()
+@dp.callback_query(F.data.startswith("save:"))
+async def save_subscription(callback: types.CallbackQuery):
+    _, prefix, route_num, dir_id, stop_idx, remind_before = callback.data.split(":")
+    user_id = str(callback.from_user.id)
 
-    # Перевіряємо, чи введено саме число
-    if not text.isdigit():
-        await message.answer("⚠️ Будь ласка, введіть число від 1 до 60:")
-        return
-
-    remind_before = int(text)
-    if not (1 <= remind_before <= 60):
-        await message.answer("⚠️ Значення має бути в межах від 1 до 60 хвилин. Спробуйте ще раз:")
-        return
-
-    data = await state.get_data()
-    prefix = data.get("prefix")
-    route_num = data.get("route")
-    dir_id = data.get("dir_id")
-    stop_idx = data.get("stop_idx")
-
-    user_id = str(message.from_user.id)
     dict_key = route_num if prefix == "t" else f"bus_{route_num}"
-
-    try:
-        direction = schedules[dict_key][int(dir_id)]
-        stop = direction["stops"][stop_idx]
-    except Exception:
-        await message.answer("❌ Сталася помилка при збереженні. Спробуйте обрати зупинку заново через «🚎 Маршрути».")
-        await state.clear()
-        return
+    direction = schedules[dict_key][int(dir_id)]
+    stop = direction["stops"][int(stop_idx)]
 
     next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
-    time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min,
-                                                                                                 int) else f"🕒 Найближчий рейс: {next_time}"
+    time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min, int) else f"🕒 Найближчий рейс: {next_time}"
 
     user_subs = subscriptions.setdefault(user_id, [])
     new_sub = {
         "prefix": prefix,
         "route": route_num,
         "dir_id": dir_id,
-        "stop_idx": stop_idx,
-        "remind_before": remind_before,
+        "stop_idx": int(stop_idx),
+        "remind_before": int(remind_before),
         "active": True,
     }
     user_subs.append(new_sub)
     save_json(SUBS_FILE, subscriptions)
 
-    # Очищаємо стан FSM після успішного збереження
-    await state.clear()
-
     icon = "🚎" if prefix == "t" else "🚌"
-    await message.answer(
-        f"✅ **Збережено успішно!**\n"
+    await callback.message.edit_text(
+        f"✅ **Збережено!**\n"
         f"{icon} Маршрут №{route_num}\n"
         f"📍 Зупинка: **{stop['name']}**\n"
         f"{time_info_str}\n"
         f"⏰ Нагадування: за **{remind_before} хв** (+ буфер на дорогу) до прибуття.\n\n"
         f"Керувати збереженими маршрутами можна у меню «🔔 Мої зупинки».",
         parse_mode="Markdown",
-        reply_markup=main_menu_kb()
     )
 
 
@@ -396,8 +351,7 @@ async def my_subscriptions(message: types.Message):
             icon = "🚎" if prefix == "t" else "🚌"
 
             next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
-            live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min,
-                                                                                       int) else f"{next_time}"
+            live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
 
             text += (
                 f"{idx + 1}. {icon} Маршрут №{route_num} — {stop['name']}\n"
@@ -455,6 +409,7 @@ async def check_schedules():
     global last_all_clear_time
     now = datetime.now(KYIV_TZ)
 
+    # Перевіряємо чи є зараз повітряна тривога в Івано-Франківську
     is_alarm = check_ivano_frankivsk_alarm()
 
     for user_id in subscriptions.keys():
@@ -486,8 +441,7 @@ async def check_schedules():
                 try:
                     live_kb = InlineKeyboardMarkup(inline_keyboard=[
                         [
-                            InlineKeyboardButton(text="🗺 DozoR (Наживо)",
-                                                 url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                            InlineKeyboardButton(text="🗺 DozoR (Наживо)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
                             InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
                         ]
                     ])
@@ -508,9 +462,10 @@ async def check_schedules():
     if is_alarm:
         return
 
+    # Перевіряємо, чи не минуло менше 60 хвилин після останнього відбою
     is_post_alarm = (
-            last_all_clear_time is not None
-            and (now - last_all_clear_time) < timedelta(hours=1)
+        last_all_clear_time is not None
+        and (now - last_all_clear_time) < timedelta(hours=1)
     )
 
     is_weekend = now.weekday() >= 5
@@ -550,6 +505,7 @@ async def check_schedules():
                     )
                     reply_kb = None
 
+                    # Якщо протягом останньої години був відбій — додаємо попередження про збитий графік
                     if is_post_alarm:
                         msg_text += (
                             "\n\n🚨 *Увага: через нещодавню тривогу графік може бути зміщений "
@@ -557,8 +513,7 @@ async def check_schedules():
                         )
                         reply_kb = InlineKeyboardMarkup(inline_keyboard=[
                             [
-                                InlineKeyboardButton(text="🗺 DozoR",
-                                                     url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                                InlineKeyboardButton(text="🗺 DozoR", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
                                 InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
                             ]
                         ])
