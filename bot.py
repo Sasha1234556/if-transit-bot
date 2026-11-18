@@ -389,6 +389,14 @@ def build_subscriptions_view(user_id: str):
 
     text = "Ваші збережені маршрути та зупинки:\n\n"
     buttons = []
+
+    # Загальна кнопка керування всіма сповіщеннями
+    any_active = any(sub.get("active", True) for sub in user_subs)
+    if any_active:
+        buttons.append([InlineKeyboardButton(text="⏸ Вимкнути всі сповіщення", callback_data="toggle:all")])
+    else:
+        buttons.append([InlineKeyboardButton(text="▶️ Увімкнути всі сповіщення", callback_data="toggle:all")])
+
     for idx, sub in enumerate(user_subs):
         prefix = sub.get("prefix", "t")
         route_num = str(sub["route"])
@@ -452,13 +460,28 @@ async def my_subscriptions(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("toggle:"))
 async def toggle_sub(callback: types.CallbackQuery):
-    idx = int(callback.data.split(":")[1])
+    target = callback.data.split(":")[1]
     user_id = str(callback.from_user.id)
-    if user_id in subscriptions and idx < len(subscriptions[user_id]):
-        curr = subscriptions[user_id][idx].get("active", True)
-        subscriptions[user_id][idx]["active"] = not curr
+
+    if user_id not in subscriptions or not subscriptions[user_id]:
+        await callback.answer("У вас немає збережених зупинок!")
+        return
+
+    if target == "all":
+        any_active = any(sub.get("active", True) for sub in subscriptions[user_id])
+        new_state = not any_active
+        for sub in subscriptions[user_id]:
+            sub["active"] = new_state
         storage.save_subscriptions(subscriptions)
-    await callback.answer("Статус змінено!")
+        await callback.answer("Всі сповіщення увімкнено! 🟢" if new_state else "Всі сповіщення на паузі! ⏸")
+    else:
+        idx = int(target)
+        if idx < len(subscriptions[user_id]):
+            curr = subscriptions[user_id][idx].get("active", True)
+            subscriptions[user_id][idx]["active"] = not curr
+            storage.save_subscriptions(subscriptions)
+        await callback.answer("Статус змінено!")
+
     await show_subscriptions(user_id, callback.message, edit=True)
 
 
