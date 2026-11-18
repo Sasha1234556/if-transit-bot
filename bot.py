@@ -1,4 +1,5 @@
 import web
+import storage
 import asyncio
 import json
 import logging
@@ -9,6 +10,7 @@ import requests
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -50,7 +52,7 @@ def save_json(filename, data):
 
 
 schedules = load_json(SCHEDULES_FILE, {})
-subscriptions = load_json(SUBS_FILE, {})
+subscriptions = storage.load_subscriptions()
 
 # Клавіатура з посиланнями на живі карти Івано-Франківська та мапу тривог
 map_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -358,7 +360,7 @@ def add_subscription(user_id, prefix, route_num, dir_id, stop_idx, remind_before
         "remind_before": int(remind_before),
         "active": True,
     })
-    save_json(SUBS_FILE, subscriptions)
+    storage.save_subscriptions(subscriptions)
 
     icon = "🚎" if prefix == "t" else "🚌"
     return (
@@ -379,61 +381,73 @@ async def save_subscription(callback: types.CallbackQuery):
 
 
 # --- Перегляд та керування збереженими зупинками ---
-@dp.message(F.text == "🔔 Мої зупинки")
-async def my_subscriptions(message: types.Message, state: FSMContext = None):
-    if state is not None:
-        await state.clear()
-    user_id = str(message.from_user.id)
+def build_subscriptions_view(user_id: str):
+    """Повертає (текст, клавіатура) зі списком підписок конкретного користувача."""
     user_subs = subscriptions.get(user_id, [])
-
     if not user_subs:
-        await message.answer("У вас ще немає збережених зупинок. Натисніть «🚎 Маршрути», щоб додати.")
-        return
+        return "У вас ще немає збережених зупинок. Натисніть «🚎 Маршрути», щоб додати.", None
 
-    try:
-        text = "Ваші збережені маршрути та зупинки:\n\n"
-        buttons = []
-        for idx, sub in enumerate(user_subs):
-            prefix = sub.get("prefix", "t")
-            route_num = str(sub["route"])
-            dir_id = int(sub["dir_id"])
-            stop_idx = int(sub["stop_idx"])
+    text = "Ваші збережені маршрути та зупинки:\n\n"
+    buttons = []
+    for idx, sub in enumerate(user_subs):
+        prefix = sub.get("prefix", "t")
+        route_num = str(sub["route"])
+        dir_id = int(sub["dir_id"])
+        stop_idx = int(sub["stop_idx"])
 
-            dict_key = route_num if prefix == "t" else f"bus_{route_num}"
-            d = schedules[dict_key][dir_id]
-            stop = d["stops"][stop_idx]
-            status = "🟢 Увімкнено" if sub.get("active", True) else "⏸ На паузі"
-            icon = "🚎" if prefix == "t" else "🚌"
+        dict_key = route_num if prefix == "t" else f"bus_{route_num}"
+        d = schedules[dict_key][dir_id]
+        stop = d["stops"][stop_idx]
+        status = "🟢 Увімкнено" if sub.get("active", True) else "⏸ На паузі"
+        icon = "🚎" if prefix == "t" else "🚌"
 
-            next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
-            live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
+        next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
+        live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
 
-            text += (
-                f"{idx + 1}. {icon} Маршрут №{route_num} — {stop['name']}\n"
-                f"   ⏳ Наступний: **{live_status}**\n"
-                f"   Сповіщення: за {sub['remind_before']} хв ({status})\n\n"
-            )
-            toggle_label = "⏸ Пауза" if sub.get("active", True) else "▶️ Увімкнути"
-            buttons.append([
-                InlineKeyboardButton(text=f"{toggle_label} #{idx + 1}", callback_data=f"toggle:{idx}"),
-                InlineKeyboardButton(text=f"🗑 Видалити #{idx + 1}", callback_data=f"del:{idx}"),
-            ])
-
-        buttons.extend([
-            [
-                InlineKeyboardButton(text="🗺 DozoR (Карта)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
-                InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
-            ],
-            [
-                InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")
-            ]
+        text += (
+            f"{idx + 1}. {icon} Маршрут №{route_num} — {stop['name']}\n"
+            f"   ⏳ Наступний: **{live_status}**\n"
+            f"   Сповіщення: за {sub['remind_before']} хв ({status})\n\n"
+        )
+        toggle_label = "⏸ Пауза" if sub.get("active", True) else "▶️ Увімкнути"
+        buttons.append([
+            InlineKeyboardButton(text=f"{toggle_label} #{idx + 1}", callback_data=f"toggle:{idx}"),
+            InlineKeyboardButton(text=f"🗑 Видалити #{idx + 1}", callback_data=f"del:{idx}"),
         ])
 
-        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    buttons.extend([
+        [
+            InlineKeyboardButton(text="🗺 DozoR (Карта)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+            InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+        ],
+        [
+            InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")
+        ]
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def show_subscriptions(user_id: str, message: types.Message, edit: bool = False):
+    """user_id передаємо окремо: у callback.message відправник — це сам бот, а не користувач."""
+    try:
+        text, kb = build_subscriptions_view(user_id)
+        if edit:
+            await message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        else:
+            await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            logging.error(f"Помилка Telegram у моїх зупинках: {e}")
     except Exception as e:
         logging.error(f"Помилка в моїх зупинках: {e}")
         await message.answer(
             "Сталася помилка при завантаженні вашого списку зупинок. Спробуйте зберегти зупинку заново через «🚎 Маршрути».")
+
+
+@dp.message(F.text == "🔔 Мої зупинки")
+async def my_subscriptions(message: types.Message, state: FSMContext):
+    await state.clear()
+    await show_subscriptions(str(message.from_user.id), message)
 
 
 @dp.callback_query(F.data.startswith("toggle:"))
@@ -443,9 +457,9 @@ async def toggle_sub(callback: types.CallbackQuery):
     if user_id in subscriptions and idx < len(subscriptions[user_id]):
         curr = subscriptions[user_id][idx].get("active", True)
         subscriptions[user_id][idx]["active"] = not curr
-        save_json(SUBS_FILE, subscriptions)
+        storage.save_subscriptions(subscriptions)
     await callback.answer("Статус змінено!")
-    await my_subscriptions(callback.message)
+    await show_subscriptions(user_id, callback.message, edit=True)
 
 
 @dp.callback_query(F.data.startswith("del:"))
@@ -454,9 +468,9 @@ async def delete_sub(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     if user_id in subscriptions and idx < len(subscriptions[user_id]):
         subscriptions[user_id].pop(idx)
-        save_json(SUBS_FILE, subscriptions)
+        storage.save_subscriptions(subscriptions)
     await callback.answer("Видалено!")
-    await my_subscriptions(callback.message)
+    await show_subscriptions(user_id, callback.message, edit=True)
 
 
 # --- Фонова перевірка розкладу щохвилини (з урахуванням тривоги та відбою) ---
@@ -467,7 +481,7 @@ async def check_schedules():
     # Перевіряємо чи є зараз повітряна тривога в Івано-Франківську
     is_alarm = check_ivano_frankivsk_alarm()
 
-    for user_id in subscriptions.keys():
+    for user_id in list(subscriptions.keys()):
         current_alarm_state = user_alarm_status.get(user_id, False)
 
         if is_alarm:
@@ -526,8 +540,8 @@ async def check_schedules():
     is_weekend = now.weekday() >= 5
     day_key = "weekends" if is_weekend else "workdays"
 
-    for user_id, user_subs in subscriptions.items():
-        for sub in user_subs:
+    for user_id, user_subs in list(subscriptions.items()):
+        for sub in list(user_subs):
             if not sub.get("active", True):
                 continue
 
@@ -535,8 +549,13 @@ async def check_schedules():
             route_num = str(sub["route"])
             dict_key = route_num if prefix == "t" else f"bus_{route_num}"
 
-            route_data = schedules.get(dict_key, [])[int(sub["dir_id"])]
-            stop_info = route_data["stops"][sub["stop_idx"]]
+            # Одна «битa» підписка не повинна ламати сповіщення всім іншим
+            try:
+                route_data = schedules.get(dict_key, [])[int(sub["dir_id"])]
+                stop_info = route_data["stops"][int(sub["stop_idx"])]
+            except (IndexError, KeyError, ValueError, TypeError) as e:
+                logging.error(f"Некоректна підписка {user_id}: {sub} ({e})")
+                continue
             offset = stop_info["offset"]
 
             # Буфер безпеки: +2 хвилини наперед

@@ -2,3 +2,4 @@ aiogram
 apscheduler
 requests
 pytz
+psycopg2-binary
