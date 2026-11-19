@@ -9,12 +9,18 @@ import pytz
 import requests
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import (
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN = "6241822896:AAHs62SrJ6RgLv58QXqvf32AQWSNRUyWXlw"
@@ -62,6 +68,150 @@ def save_json(filename, data):
 
 schedules = load_json(SCHEDULES_FILE, {})
 subscriptions = storage.load_subscriptions()
+users_data = storage.load_users()
+
+
+def _format_user_label(user_id: str, info: dict) -> str:
+    username = info.get("username")
+    full_name = info.get("full_name")
+    if username:
+        return f"@{username} (`{user_id}`)"
+    if full_name:
+        return f"{full_name} (`{user_id}`)"
+    return f"`{user_id}`"
+
+
+async def record_user_activity(user: types.User):
+    """Записує активність користувача та повідомляє лише адміна про нового користувача."""
+    if not user or user.is_bot:
+        return
+
+    user_id = str(user.id)
+    now_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M")
+    is_new = user_id not in users_data
+    was_inactive = (not is_new) and (not users_data[user_id].get("active", True))
+
+    entry = users_data.get(user_id, {})
+    if is_new:
+        entry["first_seen"] = now_str
+    entry["username"] = user.username
+    entry["full_name"] = user.full_name
+    entry["last_seen"] = now_str
+    entry["active"] = True
+    users_data[user_id] = entry
+    storage.save_users(users_data)
+
+    if ADMIN_ID and int(user.id) != ADMIN_ID:
+        label = _format_user_label(user_id, entry)
+        if is_new:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"🆕 **Новий користувач у боті!**\n"
+                        f"👤 {label}\n"
+                        f"🕒 Час: {now_str}\n"
+                        f"👥 Всього користувачів: **{len(users_data)}**"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logging.error(f"Не вдалося надіслати сповіщення про нового користувача {user_id}: {e}")
+        elif was_inactive:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"♻️ **Користувач повернувся до бота!**\n"
+                        f"👤 {label}\n"
+                        f"🕒 Час: {now_str}"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logging.error(f"Не вдалося надіслати сповіщення про повернення користувача {user_id}: {e}")
+
+
+@dp.my_chat_member()
+async def handle_my_chat_member(event: ChatMemberUpdated):
+    """Відстежує блокування/зупинку або розблокування бота користувачем (сповіщення лише адміну)."""
+    user = event.from_user
+    if not user or user.is_bot:
+        return
+
+    user_id = str(user.id)
+    now_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M")
+    new_status = event.new_chat_member.status
+
+    entry = users_data.setdefault(user_id, {"first_seen": now_str})
+    entry["username"] = user.username
+    entry["full_name"] = user.full_name
+    entry["last_seen"] = now_str
+
+    if new_status in ("kicked", "left"):
+        entry["active"] = False
+        entry["left_at"] = now_str
+        storage.save_users(users_data)
+        if ADMIN_ID and int(user.id) != ADMIN_ID:
+            label = _format_user_label(user_id, entry)
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"🚪 **Користувач зупинив/заблокував бота**\n"
+                        f"👤 {label}\n"
+                        f"🕒 Час: {now_str}"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logging.error(f"Не вдалося надіслати сповіщення про вихід користувача {user_id}: {e}")
+    elif new_status == "member":
+        entry["active"] = True
+        storage.save_users(users_data)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Статистика користувачів лише для адміністратора."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+
+    await record_user_activity(message.from_user)
+
+    # Враховуємо також тих, хто є у підписках, якщо раптом запис ще не встиг потрапити в users_data
+    all_ids = set(users_data.keys()) | set(subscriptions.keys())
+    total_users = len(all_ids)
+    active_users = sum(1 for uid in all_ids if users_data.get(uid, {}).get("active", True))
+    left_users = total_users - active_users
+    users_with_subs = sum(1 for uid, subs in subscriptions.items() if subs)
+
+    # Останні 10 користувачів за last_seen
+    sorted_users = sorted(
+        users_data.items(),
+        key=lambda item: item[1].get("last_seen", ""),
+        reverse=True,
+    )[:10]
+
+    recent_lines = []
+    for uid, info in sorted_users:
+        status_icon = "🟢" if info.get("active", True) else "🔴"
+        label = _format_user_label(uid, info)
+        seen = info.get("last_seen", "—")
+        recent_lines.append(f"{status_icon} {label} — {seen}")
+
+    recent_block = "\n".join(recent_lines) if recent_lines else "Поки немає даних."
+
+    await message.answer(
+        f"📊 **Статистика бота**\n"
+        f"👥 Всього користувачів: **{total_users}**\n"
+        f"🟢 Активних: **{active_users}**\n"
+        f"🔴 Заблокували/зупинили: **{left_users}**\n"
+        f"🔔 Зі збереженими зупинками: **{users_with_subs}**\n\n"
+        f"🕒 **Останні активні користувачі:**\n{recent_block}",
+        parse_mode="Markdown",
+    )
+
 
 # Клавіатура з посиланнями на живі карти Івано-Франківська та мапу тривог
 map_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -94,6 +244,7 @@ def cancel_feedback_kb():
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    await record_user_activity(message.from_user)
     await message.answer(
         "Привіт! Я бот розкладу тролейбусів та автобусів Івано-Франківська.\n"
         "Натисни **«🚎 Маршрути»**, скористайся кнопкою карти внизу або просто напиши назву своєї зупинки текстом, і я знайду її розклад!",
@@ -105,6 +256,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.message(F.text == "🗺 Онлайн-карта")
 async def open_map_links(message: types.Message, state: FSMContext):
     await state.clear()
+    await record_user_activity(message.from_user)
     await message.answer(
         "Оберіть сервіс для перегляду транспорту наживо або мапу тривог:",
         reply_markup=map_keyboard
@@ -114,6 +266,7 @@ async def open_map_links(message: types.Message, state: FSMContext):
 # --- Відгуки користувачів ---
 @dp.message(F.text == "💬 Відгуки")
 async def start_feedback(message: types.Message, state: FSMContext):
+    await record_user_activity(message.from_user)
     await state.set_state(FeedbackState.waiting_feedback)
     await message.answer(
         "💬 **Напишіть ваш відгук або пропозицію**\n"
@@ -141,6 +294,7 @@ async def receive_feedback(message: types.Message, state: FSMContext):
         await state.clear()
         raise SkipHandler
 
+    await record_user_activity(message.from_user)
     feedback_text = message.text.strip()
     if len(feedback_text) < 2:
         await message.answer("⚠️ Відгук занадто короткий. Напишіть, будь ласка, кілька слів або натисніть «Скасувати».")
@@ -248,6 +402,7 @@ def get_next_arrival_info(dict_key, dir_id, stop_idx):
 @dp.message(F.text == "🚎 Маршрути")
 async def choose_transport_type(message: types.Message, state: FSMContext):
     await state.clear()
+    await record_user_activity(message.from_user)
     buttons = [
         [
             InlineKeyboardButton(text="🚎 Тролейбуси", callback_data="type:trolley"),
@@ -363,6 +518,7 @@ async def receive_custom_time(message: types.Message, state: FSMContext):
 
 @dp.message(F.text & ~F.text.in_(MENU_BUTTONS))
 async def search_stop_by_text(message: types.Message):
+    await record_user_activity(message.from_user)
     query = message.text.strip().lower()
     found = []
 
@@ -540,6 +696,7 @@ async def show_subscriptions(user_id: str, message: types.Message, edit: bool = 
 @dp.message(F.text == "🔔 Мої зупинки")
 async def my_subscriptions(message: types.Message, state: FSMContext):
     await state.clear()
+    await record_user_activity(message.from_user)
     await show_subscriptions(str(message.from_user.id), message)
 
 

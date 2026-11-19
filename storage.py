@@ -1,8 +1,8 @@
-"""Зберігання підписок та відгуків користувачів.
+"""Зберігання підписок, відгуків та користувачів бота.
 
 Якщо задано змінну середовища DATABASE_URL — дані лежать у Postgres (наприклад, Neon)
 і переживають будь-які деплої та перезапуски.
-Якщо ні — використовується локальний файл subscriptions.json / feedbacks.json
+Якщо ні — використовується локальний файл subscriptions.json / feedbacks.json / users.json
 (зручно для запуску на своєму ПК).
 """
 import json
@@ -13,8 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 DATABASE_URL = os.environ.get("DATABASE_URL")
 LOCAL_FILE = "subscriptions.json"
 FEEDBACK_LOCAL_FILE = "feedbacks.json"
+USERS_LOCAL_FILE = "users.json"
 KEY = "subscriptions"
 FEEDBACK_KEY = "feedbacks"
+USERS_KEY = "users"
 
 # Один потік для запису: збереження не блокує бота (Neon після простою "прокидається"
 # кілька секунд), а порядок записів зберігається.
@@ -131,5 +133,39 @@ def save_feedback(entry: dict) -> None:
             except Exception as e:
                 logging.error(f"Не вдалося зберегти відгук у базу: {e}. Записую у локальний файл.")
         _write_local(payload, FEEDBACK_LOCAL_FILE)
+
+    _executor.submit(work)
+
+
+def load_users() -> dict:
+    if not DATABASE_URL:
+        return _read_local(USERS_LOCAL_FILE, {})
+
+    def work(cur):
+        cur.execute("CREATE TABLE IF NOT EXISTS bot_data (key TEXT PRIMARY KEY, value JSONB NOT NULL)")
+        cur.execute("SELECT value FROM bot_data WHERE key = %s", (USERS_KEY,))
+        row = cur.fetchone()
+        if row is not None and isinstance(row[0], dict):
+            return row[0]
+        return _read_local(USERS_LOCAL_FILE, {})
+
+    try:
+        return _run(work)
+    except Exception as e:
+        logging.error(f"Не вдалося завантажити користувачів з бази: {e}")
+        return _read_local(USERS_LOCAL_FILE, {})
+
+
+def save_users(data: dict) -> None:
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+    def work():
+        if DATABASE_URL:
+            try:
+                _run(lambda cur: _upsert(cur, payload, USERS_KEY))
+                return
+            except Exception as e:
+                logging.error(f"Не вдалося зберегти користувачів у базу: {e}. Записую у локальний файл.")
+        _write_local(payload, USERS_LOCAL_FILE)
 
     _executor.submit(work)
