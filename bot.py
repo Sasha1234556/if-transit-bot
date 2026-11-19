@@ -18,9 +18,14 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN = "6241822896:AAHs62SrJ6RgLv58QXqvf32AQWSNRUyWXlw"
+ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
+
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
 SCHEDULES_FILE = "schedules.json"
 SUBS_FILE = "subscriptions.json"
+
+MENU_BUTTONS = ["🚎 Маршрути", "🔔 Мої зупинки", "🗺 Онлайн-карта", "💬 Відгуки"]
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -29,6 +34,11 @@ dp = Dispatcher()
 
 class RemindState(StatesGroup):
     waiting_minutes = State()
+
+
+class FeedbackState(StatesGroup):
+    waiting_feedback = State()
+
 
 MIN_REMIND = 1
 MAX_REMIND = 60
@@ -70,10 +80,16 @@ def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🚎 Маршрути"), KeyboardButton(text="🔔 Мої зупинки")],
-            [KeyboardButton(text="🗺 Онлайн-карта")]
+            [KeyboardButton(text="🗺 Онлайн-карта"), KeyboardButton(text="💬 Відгуки")]
         ],
         resize_keyboard=True,
     )
+
+
+def cancel_feedback_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="feedback:cancel")]
+    ])
 
 
 @dp.message(CommandStart())
@@ -94,6 +110,76 @@ async def open_map_links(message: types.Message, state: FSMContext):
         "Оберіть сервіс для перегляду транспорту наживо або мапу тривог:",
         reply_markup=map_keyboard
     )
+
+
+# --- Відгуки користувачів ---
+@dp.message(F.text == "💬 Відгуки")
+async def start_feedback(message: types.Message, state: FSMContext):
+    await state.set_state(FeedbackState.waiting_feedback)
+    await message.answer(
+        "💬 **Напишіть ваш відгук або пропозицію**\n"
+        "Поділіться враженнями від роботи бота, зауваженнями щодо розкладів чи ідеями для покращення. "
+        "Надішліть текст одним повідомленням:",
+        reply_markup=cancel_feedback_kb(),
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data == "feedback:cancel")
+async def cancel_feedback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Скасовано")
+    try:
+        await callback.message.edit_text("Написання відгуку скасовано.")
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(FeedbackState.waiting_feedback, F.text)
+async def receive_feedback(message: types.Message, state: FSMContext):
+    # Якщо користувач натиснув іншу кнопку головного меню — скидаємо стан і передаємо далі
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        raise SkipHandler
+
+    feedback_text = message.text.strip()
+    if len(feedback_text) < 2:
+        await message.answer("⚠️ Відгук занадто короткий. Напишіть, будь ласка, кілька слів або натисніть «Скасувати».")
+        return
+
+    now_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M")
+    user = message.from_user
+    entry = {
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "text": feedback_text,
+        "created_at": now_str,
+    }
+    storage.save_feedback(entry)
+    await state.clear()
+
+    await message.answer(
+        "🙏 **Дякуємо за ваш відгук!** Ми обов'язково врахуємо його при подальшому розвитку бота.",
+        reply_markup=main_menu_kb(),
+        parse_mode="Markdown",
+    )
+
+    if ADMIN_ID:
+        user_label = f"@{user.username}" if user.username else (user.full_name or str(user.id))
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"💬 **Новий відгук!**\n"
+                    f"👤 Від: {user_label} (`{user.id}`)\n"
+                    f"🕒 Час: {now_str}\n\n"
+                    f"{feedback_text}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logging.error(f"Не вдалося переслати відгук адміну {ADMIN_ID}: {e}")
 
 
 # Функція перевірки повітряної тривоги в Івано-Франківську
@@ -276,7 +362,7 @@ async def receive_custom_time(message: types.Message, state: FSMContext):
     await message.answer(result, parse_mode="Markdown")
 
 
-@dp.message(F.text & ~F.text.in_(["🚎 Маршрути", "🔔 Мої зупинки", "🗺 Онлайн-карта"]))
+@dp.message(F.text & ~F.text.in_(MENU_BUTTONS))
 async def search_stop_by_text(message: types.Message):
     query = message.text.strip().lower()
     found = []
