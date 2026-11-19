@@ -43,6 +43,7 @@ class RemindState(StatesGroup):
 
 class FeedbackState(StatesGroup):
     waiting_feedback = State()
+    waiting_reply = State()
 
 
 MIN_REMIND = 1
@@ -179,14 +180,12 @@ async def cmd_stats(message: types.Message):
 
     await record_user_activity(message.from_user)
 
-    # Враховуємо також тих, хто є у підписках, якщо раптом запис ще не встиг потрапити в users_data
     all_ids = set(users_data.keys()) | set(subscriptions.keys())
     total_users = len(all_ids)
     active_users = sum(1 for uid in all_ids if users_data.get(uid, {}).get("active", True))
     left_users = total_users - active_users
     users_with_subs = sum(1 for uid, subs in subscriptions.items() if subs)
 
-    # Останні 10 користувачів за last_seen
     sorted_users = sorted(
         users_data.items(),
         key=lambda item: item[1].get("last_seen", ""),
@@ -241,6 +240,63 @@ def cancel_feedback_kb():
     ])
 
 
+async def send_admin_feedback_history(target_message: types.Message):
+    """Показує адміністратору історію відгуків і кнопки швидкої відповіді користувачам."""
+    feedbacks = storage.load_feedbacks()
+    if not feedbacks:
+        await target_message.answer("📭 Поки що немає жодного збереженого відгуку.")
+        return
+
+    indexed_recent = list(enumerate(feedbacks))[-10:]
+    indexed_recent.reverse()
+
+    lines = [f"💬 **Історія відгуків** (всього: **{len(feedbacks)}**, показані останні {len(indexed_recent)}):\n"]
+    buttons = []
+
+    for real_idx, item in indexed_recent:
+        uid = item.get("user_id")
+        username = item.get("username")
+        full_name = item.get("full_name")
+        created_at = item.get("created_at", "—")
+        text = item.get("text", "")
+
+        if username:
+            who = f"@{username} (`{uid}`)"
+        elif full_name:
+            who = f"{full_name} (`{uid}`)"
+        else:
+            who = f"`{uid}`"
+
+        lines.append(
+            f"**#{real_idx + 1}** | 🕒 {created_at}\n"
+            f"👤 Від: {who}\n"
+            f"📝 {text}\n"
+        )
+
+        if uid:
+            short_name = f"@{username}" if username else (full_name or str(uid))
+            short_name = short_name[:18]
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"↩️ Відповісти #{real_idx + 1} ({short_name})",
+                    callback_data=f"fb_reply:{real_idx}",
+                )
+            ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await target_message.answer("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.message(Command("feedbacks"))
+async def cmd_feedbacks(message: types.Message, state: FSMContext):
+    """Команда перегляду історії відгуків лише для адміністратора."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await record_user_activity(message.from_user)
+    await send_admin_feedback_history(message)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -263,10 +319,15 @@ async def open_map_links(message: types.Message, state: FSMContext):
     )
 
 
-# --- Відгуки користувачів ---
+# --- Відгуки користувачів та історія/відповіді для адміна ---
 @dp.message(F.text == "💬 Відгуки")
 async def start_feedback(message: types.Message, state: FSMContext):
     await record_user_activity(message.from_user)
+    if ADMIN_ID and message.from_user.id == ADMIN_ID:
+        await state.clear()
+        await send_admin_feedback_history(message)
+        return
+
     await state.set_state(FeedbackState.waiting_feedback)
     await message.answer(
         "💬 **Напишіть ваш відгук або пропозицію**\n"
@@ -277,17 +338,109 @@ async def start_feedback(message: types.Message, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data.startswith("fb_reply:"))
+async def start_admin_reply(callback: types.CallbackQuery, state: FSMContext):
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостатньо прав", show_alert=True)
+        return
+
+    try:
+        idx = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некоректний запит", show_alert=True)
+        return
+
+    feedbacks = storage.load_feedbacks()
+    if idx < 0 or idx >= len(feedbacks):
+        await callback.answer("Відгук не знайдено", show_alert=True)
+        return
+
+    item = feedbacks[idx]
+    target_user_id = item.get("user_id")
+    if not target_user_id:
+        await callback.answer("У відгуку відсутній ID користувача", show_alert=True)
+        return
+
+    username = item.get("username")
+    full_name = item.get("full_name")
+    who = f"@{username} (`{target_user_id}`)" if username else f"{full_name or target_user_id} (`{target_user_id}`)"
+
+    await state.set_state(FeedbackState.waiting_reply)
+    await state.update_data(
+        reply_to_user_id=int(target_user_id),
+        reply_to_label=who,
+        original_feedback=item.get("text", ""),
+    )
+
+    await callback.answer()
+    await callback.message.answer(
+        f"✍️ **Відповідь на відгук #{idx + 1}**\n"
+        f"👤 Кому: {who}\n"
+        f"💬 Відгук: _{item.get('text', '')}_\n\n"
+        f"Напишіть текст відповіді одним повідомленням:",
+        reply_markup=cancel_feedback_kb(),
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(FeedbackState.waiting_reply, F.text & ~F.text.startswith("/"))
+async def send_admin_reply(message: types.Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        raise SkipHandler
+
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
+    reply_text = message.text.strip()
+    if len(reply_text) < 1:
+        await message.answer("⚠️ Введіть текст відповіді або натисніть «Скасувати».")
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("reply_to_user_id")
+    who = data.get("reply_to_label", f"`{target_user_id}`")
+    await state.clear()
+
+    if not target_user_id:
+        await message.answer("❌ Не вдалося визначити отримувача.")
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=int(target_user_id),
+            text=(
+                f"📩 **Відповідь від адміністратора бота:**\n\n"
+                f"{reply_text}"
+            ),
+            parse_mode="Markdown",
+        )
+        await message.answer(
+            f"✅ Відповідь надіслано користувачу {who}.",
+            reply_markup=main_menu_kb(),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logging.error(f"Не вдалося надіслати відповідь користувачу {target_user_id}: {e}")
+        await message.answer(
+            f"❌ Не вдалося доставити повідомлення користувачу {who} (можливо, він заблокував бота).",
+            reply_markup=main_menu_kb(),
+            parse_mode="Markdown",
+        )
+
+
 @dp.callback_query(F.data == "feedback:cancel")
 async def cancel_feedback(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer("Скасовано")
     try:
-        await callback.message.edit_text("Написання відгуку скасовано.")
+        await callback.message.edit_text("Дію скасовано.")
     except TelegramBadRequest:
         pass
 
 
-@dp.message(FeedbackState.waiting_feedback, F.text)
+@dp.message(FeedbackState.waiting_feedback, F.text & ~F.text.startswith("/"))
 async def receive_feedback(message: types.Message, state: FSMContext):
     # Якщо користувач натиснув іншу кнопку головного меню — скидаємо стан і передаємо далі
     if message.text in MENU_BUTTONS:
@@ -320,6 +473,9 @@ async def receive_feedback(message: types.Message, state: FSMContext):
 
     if ADMIN_ID:
         user_label = f"@{user.username}" if user.username else (user.full_name or str(user.id))
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Відповісти користувачу", callback_data=f"fb_reply_uid:{user.id}")]
+        ])
         try:
             await bot.send_message(
                 chat_id=ADMIN_ID,
@@ -329,10 +485,38 @@ async def receive_feedback(message: types.Message, state: FSMContext):
                     f"🕒 Час: {now_str}\n\n"
                     f"{feedback_text}"
                 ),
+                reply_markup=reply_kb,
                 parse_mode="Markdown",
             )
         except Exception as e:
             logging.error(f"Не вдалося переслати відгук адміну {ADMIN_ID}: {e}")
+
+
+@dp.callback_query(F.data.startswith("fb_reply_uid:"))
+async def start_admin_reply_by_uid(callback: types.CallbackQuery, state: FSMContext):
+    """Швидка відповідь прямо з миттєвого сповіщення про новий відгук."""
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостатньо прав", show_alert=True)
+        return
+
+    try:
+        target_user_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некоректний ID", show_alert=True)
+        return
+
+    info = users_data.get(str(target_user_id), {})
+    who = _format_user_label(str(target_user_id), info)
+
+    await state.set_state(FeedbackState.waiting_reply)
+    await state.update_data(reply_to_user_id=target_user_id, reply_to_label=who)
+    await callback.answer()
+    await callback.message.answer(
+        f"✍️ **Відповідь користувачу** {who}\n"
+        f"Напишіть текст відповіді одним повідомленням:",
+        reply_markup=cancel_feedback_kb(),
+        parse_mode="Markdown",
+    )
 
 
 # Функція перевірки повітряної тривоги в Івано-Франківську
@@ -492,7 +676,7 @@ async def choose_stop(callback: types.CallbackQuery):
     )
 
 
-@dp.message(RemindState.waiting_minutes, F.text)
+@dp.message(RemindState.waiting_minutes, F.text & ~F.text.startswith("/"))
 async def receive_custom_time(message: types.Message, state: FSMContext):
     text = message.text.strip()
 
@@ -516,7 +700,7 @@ async def receive_custom_time(message: types.Message, state: FSMContext):
     await message.answer(result, parse_mode="Markdown")
 
 
-@dp.message(F.text & ~F.text.in_(MENU_BUTTONS))
+@dp.message(F.text & ~F.text.in_(MENU_BUTTONS) & ~F.text.startswith("/"))
 async def search_stop_by_text(message: types.Message):
     await record_user_activity(message.from_user)
     query = message.text.strip().lower()
