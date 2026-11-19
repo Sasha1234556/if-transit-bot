@@ -18,8 +18,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN = "6241822896:AAHs62SrJ6RgLv58QXqvf32AQWSNRUyWXlw"
-ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
-ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
+ADMIN_ID = 1589200303  # ваш Telegram ID
 
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
 SCHEDULES_FILE = "schedules.json"
