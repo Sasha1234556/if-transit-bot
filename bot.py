@@ -660,8 +660,8 @@ def build_subscriptions_view(user_id: str):
         )
         toggle_label = "⏸ Пауза" if sub.get("active", True) else "▶️ Увімкнути"
         buttons.append([
-            InlineKeyboardButton(text=f"{toggle_label} #{idx + 1}", callback_data=f"toggle:{idx}"),
-            InlineKeyboardButton(text=f"🗑 Видалити #{idx + 1}", callback_data=f"del:{idx}"),
+            InlineKeyboardButton(text=f"{toggle_label} {icon} №{route_num}", callback_data=f"toggle:{idx}"),
+            InlineKeyboardButton(text=f"🗑 Видалити {icon} №{route_num}", callback_data=f"del:{idx}"),
         ])
 
     buttons.extend([
