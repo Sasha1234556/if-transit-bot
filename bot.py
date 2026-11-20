@@ -51,12 +51,14 @@ MAX_REMIND = 60
 
 # Словник для відстеження стану тривоги для користувачів
 user_alarm_status = {}
-# Час останнього відбою тривоги (для попередження про збитий графік протягом 1 години)
+# Час останнього реального відбою тривоги (для попередження про збитий графік протягом 1 години)
 last_all_clear_time = None
-# Ручне перевизначення тривоги адміністратором: None = авто (API), True = примусова тривога, False = примусовий відбій
+# Ручне перевизначення тривоги адміністратором: None = авто (API), True = примусова тривога
 manual_alarm_override = None
 # Останній відомий стан тривоги за автоперевіркою/ручним режимом
 last_effective_alarm_state = False
+# Чи була поточна/остання тривога реальною (зафіксованою через API), а не тренувальною через /alarm_on
+was_real_alarm = False
 
 
 def load_json(filename, default):
@@ -218,16 +220,17 @@ async def cmd_stats(message: types.Message):
 
 @dp.message(Command("alarm_on"))
 async def cmd_alarm_on(message: types.Message, state: FSMContext):
-    """Примусово вмикає режим повітряної тривоги та паузу сповіщень (лише для адміна)."""
-    global manual_alarm_override
+    """Примусово вмикає тренувальний/ручний режим тривоги та паузу сповіщень (лише для адміна)."""
+    global manual_alarm_override, was_real_alarm
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
         return
     await state.clear()
     manual_alarm_override = True
+    was_real_alarm = False
     await message.answer(
-        "🔴 **Режим тривоги увімкнено вручну.**\n"
+        "🔴 **Увімкнено ручний режим тривоги (тренувальний).**\n"
         "Бот сповістить користувачів про червоний рівень небезпеки та призупинить нагадування про вихід на зупинку.\n"
-        "Для повернення в авторежим або зняття тривоги використайте `/alarm_off`.",
+        "Після `/alarm_off` попередження про відхилення від графіка на 1 годину **не вмикатиметься**.",
         parse_mode="Markdown",
     )
     await check_schedules()
@@ -236,19 +239,29 @@ async def cmd_alarm_on(message: types.Message, state: FSMContext):
 @dp.message(Command("alarm_off"))
 async def cmd_alarm_off(message: types.Message, state: FSMContext):
     """Знімає ручну тривогу та повертає бота в автоматичний режим перевірки API (лише для адміна)."""
-    global manual_alarm_override, last_all_clear_time
+    global manual_alarm_override, last_all_clear_time, was_real_alarm
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    was_alarm = manual_alarm_override is True or last_effective_alarm_state
+    had_manual_alarm = manual_alarm_override is True
     manual_alarm_override = None
-    if was_alarm:
+
+    if was_real_alarm and not had_manual_alarm:
         last_all_clear_time = datetime.now(KYIV_TZ)
-    await message.answer(
-        "🟢 **Ручний режим тривоги вимкнено, відновлено автоперевірку API.**\n"
-        "Протягом 1 години після відбою сповіщення міститимуть попередження про можливе відхилення від графіка.",
-        parse_mode="Markdown",
-    )
+        was_real_alarm = False
+        await message.answer(
+            "🟢 **Реальну тривогу завершено, відновлено автоперевірку API.**\n"
+            "Протягом 1 години у нагадуваннях буде попередження про можливе відхилення від графіка.",
+            parse_mode="Markdown",
+        )
+    else:
+        was_real_alarm = False
+        last_all_clear_time = None
+        await message.answer(
+            "🟢 **Ручний режим вимкнено, відновлено автоперевірку API.**\n"
+            "Оскільки це була тренувальна перевірка, попередження про відхилення від графіка не вмикається.",
+            parse_mode="Markdown",
+        )
     await check_schedules()
 
 
@@ -266,7 +279,7 @@ async def cmd_alarm_status(message: types.Message, state: FSMContext):
         and (now - last_all_clear_time) < timedelta(hours=1)
     )
     mode_label = (
-        "🔴 Примусово увімкнено (/alarm_on)"
+        "🔴 Ручний / тренувальний (/alarm_on)"
         if manual_alarm_override is True
         else "🤖 Автоматично через API"
     )
@@ -275,8 +288,8 @@ async def cmd_alarm_status(message: types.Message, state: FSMContext):
         f"🚨 **Статус тривоги:** {'🔴 АКТИВНА' if effective_alarm else '🟢 НЕМАЄ'}\n"
         f"⚙️ **Режим:** {mode_label}\n"
         f"🌐 **Дані API:** {'тривога' if api_alarm else 'спокійно'}\n"
-        f"🕒 **Останній відбій:** {clear_str}\n"
-        f"⏳ **Попередження про відхилення (1 год після відбою):** {'так' if post_alarm_active else 'ні'}",
+        f"🕒 **Останній відбій (реальний):** {clear_str}\n"
+        f"⏳ **Попередження про відхилення (1 год після реального відбою):** {'так' if post_alarm_active else 'ні'}",
         parse_mode="Markdown",
     )
 
@@ -1016,11 +1029,15 @@ async def delete_sub(callback: types.CallbackQuery):
 
 # --- Фонова перевірка розкладу щохвилини (з урахуванням тривоги та відбою) ---
 async def check_schedules():
-    global last_all_clear_time, last_effective_alarm_state
+    global last_all_clear_time, last_effective_alarm_state, was_real_alarm
     now = datetime.now(KYIV_TZ)
 
-    # Перевіряємо чи є зараз повітряна тривога в Івано-Франківську (авто або ручний режим)
-    is_alarm = get_effective_alarm_status()
+    # Перевіряємо чи є зараз реальна тривога через API та враховуємо ручний режим
+    api_alarm = check_ivano_frankivsk_alarm()
+    if api_alarm:
+        was_real_alarm = True
+
+    is_alarm = True if manual_alarm_override is True else api_alarm
     last_effective_alarm_state = is_alarm
 
     for user_id in list(subscriptions.keys()):
@@ -1048,31 +1065,42 @@ async def check_schedules():
         else:
             if current_alarm_state:
                 user_alarm_status[user_id] = False
-                last_all_clear_time = now
-                try:
-                    live_kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="🗺 DozoR (Наживо)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
-                            InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
-                        ]
-                    ])
-                    await bot.send_message(
-                        chat_id=int(user_id),
-                        text=(
-                            "🟢 **Відбій повітряної тривоги!**\n"
-                            "⚠️ Протягом найближчої години транспорт може бути відхилений від графіка "
-                            "(згодом рух поступово стабілізується). Рекомендуємо звірятися з онлайн-картою:"
-                        ),
-                        reply_markup=live_kb,
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logging.error(f"Не вдалося надіслати сповіщення про відбій {user_id}: {e}")
+                if was_real_alarm:
+                    last_all_clear_time = now
+                    was_real_alarm = False
+                    try:
+                        live_kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [
+                                InlineKeyboardButton(text="🗺 DozoR (Наживо)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                                InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+                            ]
+                        ])
+                        await bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                "🟢 **Відбій повітряної тривоги!**\n"
+                                "⚠️ Протягом найближчої години транспорт може бути відхилений від графіка "
+                                "(згодом рух поступово стабілізується). Рекомендуємо звірятися з онлайн-картою:"
+                            ),
+                            reply_markup=live_kb,
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logging.error(f"Не вдалося надіслати сповіщення про відбій {user_id}: {e}")
+                else:
+                    try:
+                        await bot.send_message(
+                            chat_id=int(user_id),
+                            text="🟢 **Тренувальний режим тривоги завершено.** Сповіщення про зупинки працюють у звичайному режимі.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logging.error(f"Не вдалося надіслати сповіщення про завершення тренування {user_id}: {e}")
 
     if is_alarm:
         return
 
-    # Перевіряємо, чи не минуло менше 60 хвилин після останнього відбою
+    # Перевіряємо, чи не минуло менше 60 хвилин після останнього реального відбою
     is_post_alarm = (
         last_all_clear_time is not None
         and (now - last_all_clear_time) < timedelta(hours=1)
@@ -1120,7 +1148,7 @@ async def check_schedules():
                     )
                     reply_kb = None
 
-                    # Протягом 1 години після відбою попереджаємо про можливе відхилення від графіка
+                    # Протягом 1 години після реального відбою попереджаємо про можливе відхилення від графіка
                     if is_post_alarm:
                         msg_text += (
                             "\n\n🚨 *Увага: після недавньої тривоги транспорт може бути відхилений від графіка "
