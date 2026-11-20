@@ -51,8 +51,12 @@ MAX_REMIND = 60
 
 # Словник для відстеження стану тривоги для користувачів
 user_alarm_status = {}
-# Час останнього відбою тривоги (для попередження про збитий графік)
+# Час останнього відбою тривоги (для попередження про збитий графік протягом 1 години)
 last_all_clear_time = None
+# Ручне перевизначення тривоги адміністратором: None = авто (API), True = примусова тривога, False = примусовий відбій
+manual_alarm_override = None
+# Останній відомий стан тривоги за автоперевіркою/ручним режимом
+last_effective_alarm_state = False
 
 
 def load_json(filename, default):
@@ -208,6 +212,71 @@ async def cmd_stats(message: types.Message):
         f"🔴 Заблокували/зупинили: **{left_users}**\n"
         f"🔔 Зі збереженими зупинками: **{users_with_subs}**\n\n"
         f"🕒 **Останні активні користувачі:**\n{recent_block}",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("alarm_on"))
+async def cmd_alarm_on(message: types.Message, state: FSMContext):
+    """Примусово вмикає режим повітряної тривоги та паузу сповіщень (лише для адміна)."""
+    global manual_alarm_override
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    manual_alarm_override = True
+    await message.answer(
+        "🔴 **Режим тривоги увімкнено вручну.**\n"
+        "Бот сповістить користувачів про червоний рівень небезпеки та призупинить нагадування про вихід на зупинку.\n"
+        "Для повернення в авторежим або зняття тривоги використайте `/alarm_off`.",
+        parse_mode="Markdown",
+    )
+    await check_schedules()
+
+
+@dp.message(Command("alarm_off"))
+async def cmd_alarm_off(message: types.Message, state: FSMContext):
+    """Знімає ручну тривогу та повертає бота в автоматичний режим перевірки API (лише для адміна)."""
+    global manual_alarm_override, last_all_clear_time
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    was_alarm = manual_alarm_override is True or last_effective_alarm_state
+    manual_alarm_override = None
+    if was_alarm:
+        last_all_clear_time = datetime.now(KYIV_TZ)
+    await message.answer(
+        "🟢 **Ручний режим тривоги вимкнено, відновлено автоперевірку API.**\n"
+        "Протягом 1 години після відбою сповіщення міститимуть попередження про можливе відхилення від графіка.",
+        parse_mode="Markdown",
+    )
+    await check_schedules()
+
+
+@dp.message(Command("alarm_status"))
+async def cmd_alarm_status(message: types.Message, state: FSMContext):
+    """Показує поточний статус тривоги та вікна стабілізації (лише для адміна)."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    now = datetime.now(KYIV_TZ)
+    api_alarm = check_ivano_frankivsk_alarm()
+    effective_alarm = get_effective_alarm_status()
+    post_alarm_active = (
+        last_all_clear_time is not None
+        and (now - last_all_clear_time) < timedelta(hours=1)
+    )
+    mode_label = (
+        "🔴 Примусово увімкнено (/alarm_on)"
+        if manual_alarm_override is True
+        else "🤖 Автоматично через API"
+    )
+    clear_str = last_all_clear_time.strftime("%H:%M") if last_all_clear_time else "—"
+    await message.answer(
+        f"🚨 **Статус тривоги:** {'🔴 АКТИВНА' if effective_alarm else '🟢 НЕМАЄ'}\n"
+        f"⚙️ **Режим:** {mode_label}\n"
+        f"🌐 **Дані API:** {'тривога' if api_alarm else 'спокійно'}\n"
+        f"🕒 **Останній відбій:** {clear_str}\n"
+        f"⏳ **Попередження про відхилення (1 год після відбою):** {'так' if post_alarm_active else 'ні'}",
         parse_mode="Markdown",
     )
 
@@ -519,19 +588,42 @@ async def start_admin_reply_by_uid(callback: types.CallbackQuery, state: FSMCont
     )
 
 
-# Функція перевірки повітряної тривоги в Івано-Франківську
+# Функція перевірки повітряної тривоги в Івано-Франківську (з резервом за структурою відповіді)
 def check_ivano_frankivsk_alarm():
     try:
-        resp = requests.get("https://alerts.in.ua/api/v1/alerts", timeout=5)
+        resp = requests.get("https://alerts.in.ua/api/v1/alerts", timeout=6)
         if resp.status_code == 200:
             data = resp.json()
-            for item in data.get("states", []):
-                if "івано-франк" in item.get("location_title", "").lower():
-                    if item.get("alert_type") == "air_raid" and not item.get("finished_at"):
+            entries = data.get("states") or data.get("alerts") or []
+            if not isinstance(entries, list):
+                return False
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                loc = str(
+                    item.get("location_title")
+                    or item.get("name")
+                    or item.get("title")
+                    or ""
+                ).lower()
+                if "івано-франк" in loc or "ivano-frank" in loc:
+                    alert_type = str(item.get("alert_type") or item.get("type") or "air_raid").lower()
+                    finished_at = item.get("finished_at") or item.get("end")
+                    is_active_flag = item.get("active")
+                    if alert_type in ("air_raid", "alert", "") and not finished_at and is_active_flag is not False:
                         return True
+        else:
+            logging.warning(f"API тривог повернув статус {resp.status_code}")
     except Exception as e:
         logging.error(f"Помилка перевірки тривоги: {e}")
     return False
+
+
+def get_effective_alarm_status():
+    """Повертає актуальний стан тривоги з урахуванням ручного перемикача адміністратора."""
+    if manual_alarm_override is True:
+        return True
+    return check_ivano_frankivsk_alarm()
 
 
 # Допоміжна функція для пошуку найближчого часу прибуття на зупинку
@@ -924,11 +1016,12 @@ async def delete_sub(callback: types.CallbackQuery):
 
 # --- Фонова перевірка розкладу щохвилини (з урахуванням тривоги та відбою) ---
 async def check_schedules():
-    global last_all_clear_time
+    global last_all_clear_time, last_effective_alarm_state
     now = datetime.now(KYIV_TZ)
 
-    # Перевіряємо чи є зараз повітряна тривога в Івано-Франківську
-    is_alarm = check_ivano_frankivsk_alarm()
+    # Перевіряємо чи є зараз повітряна тривога в Івано-Франківську (авто або ручний режим)
+    is_alarm = get_effective_alarm_status()
+    last_effective_alarm_state = is_alarm
 
     for user_id in list(subscriptions.keys()):
         current_alarm_state = user_alarm_status.get(user_id, False)
@@ -944,7 +1037,7 @@ async def check_schedules():
                         chat_id=int(user_id),
                         text=(
                             "🔴 **Увага! В місті Івано-Франківськ повітряна тривога (червоний рівень небезпеки).**\n"
-                            "Транспорт тимчасово не курсує до відбою. Сповіщення про прибуття зупинено."
+                            "Нагадування про вихід на зупинку тимчасово призупинено до відбою."
                         ),
                         reply_markup=alarm_kb,
                         parse_mode="Markdown",
@@ -967,9 +1060,8 @@ async def check_schedules():
                         chat_id=int(user_id),
                         text=(
                             "🟢 **Відбій повітряної тривоги!**\n"
-                            "⚠️ Зверніть увагу: після тривоги графіки руху тимчасово збиті. "
-                            "Транспорт може відхилятися від розкладу (прибувати пізніше або раніше). "
-                            "Рекомендуємо звірятися з онлайн-картою:"
+                            "⚠️ Протягом найближчої години транспорт може бути відхилений від графіка "
+                            "(згодом рух поступово стабілізується). Рекомендуємо звірятися з онлайн-картою:"
                         ),
                         reply_markup=live_kb,
                         parse_mode="Markdown",
@@ -1028,11 +1120,12 @@ async def check_schedules():
                     )
                     reply_kb = None
 
-                    # Якщо протягом останньої години був відбій — додаємо попередження про збитий графік
+                    # Протягом 1 години після відбою попереджаємо про можливе відхилення від графіка
                     if is_post_alarm:
                         msg_text += (
-                            "\n\n🚨 *Увага: через нещодавню тривогу графік може бути зміщений "
-                            "(транспорт може прибути раніше або пізніше). Перевірте GPS на карті:*"
+                            "\n\n🚨 *Увага: після недавньої тривоги транспорт може бути відхилений від графіка "
+                            "(прибувати раніше або пізніше), але згодом рух поступово стабілізується. "
+                            "Перевірте GPS на карті:*"
                         )
                         reply_kb = InlineKeyboardMarkup(inline_keyboard=[
                             [
