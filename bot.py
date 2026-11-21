@@ -206,20 +206,21 @@ async def cmd_stats(message: types.Message):
     recent_lines = []
     for uid, info in sorted_users:
         status_icon = "🟢" if info.get("active", True) else "🔴"
-        label = _format_user_label(uid, info)
+        username = info.get("username")
+        full_name = info.get("full_name")
+        label = f"@{username} ({uid})" if username else f"{full_name or uid} ({uid})"
         seen = info.get("last_seen", "—")
         recent_lines.append(f"{status_icon} {label} — {seen}")
 
     recent_block = "\n".join(recent_lines) if recent_lines else "Поки немає даних."
 
     await message.answer(
-        f"📊 **Статистика бота**\n"
-        f"👥 Всього користувачів: **{total_users}**\n"
-        f"🟢 Активних: **{active_users}**\n"
-        f"🔴 Заблокували/зупинили: **{left_users}**\n"
-        f"🔔 Зі збереженими зупинками: **{users_with_subs}**\n\n"
-        f"🕒 **Останні активні користувачі:**\n{recent_block}",
-        parse_mode="Markdown",
+        f"📊 Статистика бота\n"
+        f"👥 Всього користувачів: {total_users}\n"
+        f"🟢 Активних: {active_users}\n"
+        f"🔴 Заблокували/зупинили: {left_users}\n"
+        f"🔔 Зі збереженими зупинками: {users_with_subs}\n\n"
+        f"🕒 Останні активні користувачі:\n{recent_block}"
     )
 
 
