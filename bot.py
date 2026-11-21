@@ -27,6 +27,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN = "6241822896:AAHs62SrJ6RgLv58QXqvf32AQWSNRUyWXlw"
 ADMIN_ID = 1589200303  # ваш Telegram ID
+ALERTS_TOKEN = os.getenv("ALERTS_TOKEN", "").strip()
 
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
 SCHEDULES_FILE = "schedules.json"
@@ -615,32 +616,47 @@ async def start_admin_reply_by_uid(callback: types.CallbackQuery, state: FSMCont
     )
 
 
-# Функція перевірки повітряної тривоги в Івано-Франківську (з резервом за структурою відповіді)
+# Функція перевірки повітряної тривоги в Івано-Франківську (офіційний API з токеном + резерв через канал сповіщень)
 def check_ivano_frankivsk_alarm():
-    try:
-        resp = requests.get("https://alerts.in.ua/api/v1/alerts", timeout=6)
-        if resp.status_code == 200:
-            data = resp.json()
-            entries = data.get("states") or data.get("alerts") or []
-            if not isinstance(entries, list):
+    if ALERTS_TOKEN:
+        try:
+            resp = requests.get(
+                "https://api.alerts.in.ua/v1/alerts/active.json",
+                headers={"Authorization": f"Bearer {ALERTS_TOKEN}"},
+                timeout=6,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                entries = data.get("alerts") or []
+                for item in entries:
+                    loc = str(item.get("location_title") or item.get("location_oblast") or "").lower()
+                    if "івано-франк" in loc or "ivano-frank" in loc:
+                        if item.get("alert_type") == "air_raid":
+                            return True
                 return False
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                loc = str(
-                    item.get("location_title")
-                    or item.get("name")
-                    or item.get("title")
-                    or ""
-                ).lower()
-                if "івано-франк" in loc or "ivano-frank" in loc:
-                    alert_type = str(item.get("alert_type") or item.get("type") or "air_raid").lower()
-                    finished_at = item.get("finished_at") or item.get("end")
-                    is_active_flag = item.get("active")
-                    if alert_type in ("air_raid", "alert", "") and not finished_at and is_active_flag is not False:
+            else:
+                logging.warning(f"API alerts.in.ua повернув статус {resp.status_code}")
+        except Exception as e:
+            logging.error(f"Помилка API alerts.in.ua: {e}")
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = requests.get("https://t.me/s/air_alert_ua", headers=headers, timeout=8)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            messages = [
+                div.get_text(" ", strip=True).lower()
+                for div in soup.select("div.tgme_widget_message_text")
+            ]
+            for msg in reversed(messages):
+                if "івано-франківськ" in msg:
+                    if "відбій" in msg or "🟢" in msg:
+                        return False
+                    if "повітряна тривога" in msg or "🔴" in msg:
                         return True
+            return False
         else:
-            logging.warning(f"API тривог повернув статус {resp.status_code}")
+            logging.warning(f"Канал тривог повернув статус {resp.status_code}")
     except Exception as e:
         logging.error(f"Помилка перевірки тривоги: {e}")
     return False
@@ -669,6 +685,16 @@ REROUTE_KEYWORDS = (
     "не курсують",
     "зміна руху",
 )
+
+
+def _clean_eway_post_text(post_text: str) -> str:
+    cleaned = re.split(
+        r"\n?Деталі маршрутів на EasyWay\b.*",
+        post_text,
+        maxsplit=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )[0]
+    return cleaned.strip()
 
 
 def _normalize_uk_word(word: str) -> str:
@@ -704,8 +730,8 @@ def extract_routes_from_eway_text(text: str) -> list[str]:
     return found_keys
 
 
-def find_detour_stops_from_text(text: str) -> tuple[list[str], list[str]]:
-    """Витягує з тексту посту вулиці/зупинки об'їзду та зіставляє їх із зупинками у schedules.json."""
+def find_detour_stops_from_text(text: str, r_key: str | None = None) -> tuple[list[str], list[str]]:
+    """Витягує з тексту посту вулиці/зупинки об'їзду та зіставляє їх із зупинками маршруту у schedules.json."""
     detour_part = text
     m = re.search(
         r"(рух\s+(?:автобусів|тролейбусів|транспорту)\s+організовано.+)",
@@ -715,7 +741,7 @@ def find_detour_stops_from_text(text: str) -> tuple[list[str], list[str]]:
     if m:
         detour_part = m.group(1)
 
-    tokens = [
+    raw_tokens = [
         _normalize_uk_word(w)
         for w in re.findall(r"[А-ЯІЇЄҐа-яіїєґ0-9'-]+", detour_part)
         if len(w) >= 4
@@ -725,26 +751,37 @@ def find_detour_stops_from_text(text: str) -> tuple[list[str], list[str]]:
         "автобусів", "тролейбусів", "організовано", "тимчасово",
         "просять", "пасажирів",
     }
-    tokens = [t for t in tokens if t not in stop_words and len(t) >= 4]
+    tokens = [t for t in raw_tokens if t not in stop_words and len(t) >= 4]
+
+    target_entries = schedules[r_key] if (r_key and r_key in schedules) else [
+        d for dirs in schedules.values() for d in dirs
+    ]
 
     matched_stops = []
-    seen = set()
-    for directions in schedules.values():
-        for d in directions:
-            for st in d.get("stops", []):
-                st_name = st["name"]
-                st_low = st_name.lower()
-                if any(tok in st_low for tok in tokens):
-                    if st_name not in seen:
-                        seen.add(st_name)
-                        matched_stops.append(st_name)
+    seen_norm = set()
+    for d in target_entries:
+        for st in d.get("stops", []):
+            st_name = st["name"]
+            st_low = st_name.lower()
+            if any(tok in st_low for tok in tokens):
+                norm_key = re.sub(r"[\s.,'\"()-]+", "", st_low)
+                if norm_key not in seen_norm:
+                    seen_norm.add(norm_key)
+                    matched_stops.append(st_name)
 
     raw_streets = re.findall(
         r"(?:вул\.|вулицями|вулицею|просп\.|пл\.|площею)\s*([А-ЯІЇЄҐ][а-яіїєґА-ЯІЇЄҐ0-9\s,'’\"-]{2,45})",
         detour_part,
     )
-    cleaned_streets = [s.strip(" .,;\n") for s in raw_streets if s.strip(" .,;\n")]
-    return matched_stops[:12], cleaned_streets
+    cleaned_streets = []
+    seen_streets = set()
+    for s in raw_streets:
+        st_clean = s.strip(" .,;\n")
+        if st_clean and st_clean.lower() not in seen_streets:
+            seen_streets.add(st_clean.lower())
+            cleaned_streets.append(st_clean)
+
+    return matched_stops[:6], cleaned_streets
 
 
 def build_route_reroute_message(r_key: str, post_text: str, user_subs_for_route: list[dict]) -> str:
@@ -753,7 +790,8 @@ def build_route_reroute_message(r_key: str, post_text: str, user_subs_for_route:
     icon = "🚌" if is_bus else "🚎"
     transport_word = "Автобус" if is_bus else "Тролейбус"
 
-    matched_stops, raw_streets = find_detour_stops_from_text(post_text)
+    clean_post = _clean_eway_post_text(post_text)
+    matched_stops, raw_streets = find_detour_stops_from_text(clean_post, r_key=r_key)
 
     user_stop_names = []
     directions = schedules.get(r_key, [])
@@ -772,7 +810,7 @@ def build_route_reroute_message(r_key: str, post_text: str, user_subs_for_route:
     if user_stop_names:
         lines.append(f"📍 Ваша збережена зупинка: **{', '.join(user_stop_names)}**")
 
-    lines.append(f"\n📢 **Повідомлення каналу:**\n_{post_text.strip()}_")
+    lines.append(f"\n📢 **Повідомлення каналу:**\n_{clean_post}_")
 
     if matched_stops:
         stops_bullets = "\n".join(f"• {s}" for s in matched_stops)
@@ -855,9 +893,9 @@ async def check_eway_channel(force_latest: bool = False) -> str:
     active_alerts = eway_state.setdefault("active_alerts", {})
 
     if not seen_ids and not force_latest:
-        eway_state["seen_post_ids"] = [pid for pid, _ in posts[-30:]]
+        eway_state["seen_post_ids"] = [pid for pid, _ in posts[-50:]]
         storage.save_eway_state(eway_state)
-        return "ℹ️ Ініціалізовано список постів каналу."
+        return "ℹ️ Ініціалізовано список постів каналу (старі пости не розсилались)."
 
     candidates = posts[-1:] if force_latest else [(pid, txt) for pid, txt in posts if pid not in seen_ids]
     processed_count = 0
@@ -887,7 +925,7 @@ async def check_eway_channel(force_latest: bool = False) -> str:
             await notify_subscribers_about_reroute(r_key, pid, txt)
             processed_count += 1
 
-    eway_state["seen_post_ids"] = list(seen_ids)[-50:]
+    eway_state["seen_post_ids"] = list(seen_ids)[-100:]
     storage.save_eway_state(eway_state)
     return f"✅ Перевірку завершено. Розіслано оновлень по маршрутах: {processed_count}."
 
