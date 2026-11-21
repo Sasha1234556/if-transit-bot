@@ -1184,19 +1184,6 @@ def add_subscription(user_id, prefix, route_num, dir_id, stop_idx, remind_before
     })
     storage.save_subscriptions(subscriptions)
 
-    active_alert = eway_state.get("active_alerts", {}).get(dict_key)
-    reroute_notice = ""
-    if active_alert:
-        try:
-            updated_at = datetime.fromisoformat(active_alert["updated_at"])
-            if (datetime.now(KYIV_TZ) - updated_at) < timedelta(hours=48):
-                reroute_notice = (
-                    "\n\n⚠️ **Увага! Зараз на цьому маршруті діє зміна руху (EasyWay ІФ):**\n"
-                    f"_{active_alert['text'].strip()}_"
-                )
-        except Exception:
-            pass
-
     icon = "🚎" if prefix == "t" else "🚌"
     return (
         f"✅ **Збережено!**\n"
@@ -1205,7 +1192,6 @@ def add_subscription(user_id, prefix, route_num, dir_id, stop_idx, remind_before
         f"{time_info_str}\n"
         f"⏰ Нагадування: за **{remind_before} хв** (+ буфер на дорогу) до прибуття.\n\n"
         f"Керувати збереженими маршрутами можна у меню «🔔 Мої зупинки»."
-        f"{reroute_notice}"
     )
 
 
