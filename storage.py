@@ -14,9 +14,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 LOCAL_FILE = "subscriptions.json"
 FEEDBACK_LOCAL_FILE = "feedbacks.json"
 USERS_LOCAL_FILE = "users.json"
+EWAY_LOCAL_FILE = "eway_state.json"
 KEY = "subscriptions"
 FEEDBACK_KEY = "feedbacks"
 USERS_KEY = "users"
+EWAY_KEY = "eway_state"
 
 # Один потік для запису: збереження не блокує бота (Neon після простою "прокидається"
 # кілька секунд), а порядок записів зберігається.
@@ -170,39 +172,38 @@ def save_users(data: dict) -> None:
 
     _executor.submit(work)
 
-    EWAY_LOCAL_FILE = "eway_state.json"
-    EWAY_KEY = "eway_state"
 
-    def load_eway_state() -> dict:
-        default_state = {"seen_post_ids": [], "active_alerts": {}}
-        if not DATABASE_URL:
-            data = _read_local(EWAY_LOCAL_FILE, default_state)
-            return data if isinstance(data, dict) else default_state
+def load_eway_state() -> dict:
+    default_state = {"seen_post_ids": [], "active_alerts": {}}
+    if not DATABASE_URL:
+        data = _read_local(EWAY_LOCAL_FILE, default_state)
+        return data if isinstance(data, dict) else default_state
 
-        def work(cur):
-            cur.execute("CREATE TABLE IF NOT EXISTS bot_data (key TEXT PRIMARY KEY, value JSONB NOT NULL)")
-            cur.execute("SELECT value FROM bot_data WHERE key = %s", (EWAY_KEY,))
-            row = cur.fetchone()
-            if row is not None and isinstance(row[0], dict):
-                return row[0]
-            return _read_local(EWAY_LOCAL_FILE, default_state)
+    def work(cur):
+        cur.execute("CREATE TABLE IF NOT EXISTS bot_data (key TEXT PRIMARY KEY, value JSONB NOT NULL)")
+        cur.execute("SELECT value FROM bot_data WHERE key = %s", (EWAY_KEY,))
+        row = cur.fetchone()
+        if row is not None and isinstance(row[0], dict):
+            return row[0]
+        return _read_local(EWAY_LOCAL_FILE, default_state)
 
-        try:
-            return _run(work)
-        except Exception as e:
-            logging.error(f"Не вдалося завантажити стан EasyWay з бази: {e}")
-            return _read_local(EWAY_LOCAL_FILE, default_state)
+    try:
+        return _run(work)
+    except Exception as e:
+        logging.error(f"Не вдалося завантажити стан EasyWay з бази: {e}")
+        return _read_local(EWAY_LOCAL_FILE, default_state)
 
-    def save_eway_state(data: dict) -> None:
-        payload = json.dumps(data, ensure_ascii=False, indent=2)
 
-        def work():
-            if DATABASE_URL:
-                try:
-                    _run(lambda cur: _upsert(cur, payload, EWAY_KEY))
-                    return
-                except Exception as e:
-                    logging.error(f"Не вдалося зберегти стан EasyWay в базу: {e}. Записую у локальний файл.")
-            _write_local(payload, EWAY_LOCAL_FILE)
+def save_eway_state(data: dict) -> None:
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
 
-        _executor.submit(work)
+    def work():
+        if DATABASE_URL:
+            try:
+                _run(lambda cur: _upsert(cur, payload, EWAY_KEY))
+                return
+            except Exception as e:
+                logging.error(f"Не вдалося зберегти стан EasyWay в базу: {e}. Записую у локальний файл.")
+        _write_local(payload, EWAY_LOCAL_FILE)
+
+    _executor.submit(work)
