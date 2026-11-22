@@ -670,6 +670,11 @@ def get_effective_alarm_status():
     return check_ivano_frankivsk_alarm()
 
 
+def is_alarm_notification_allowed(now: datetime) -> bool:
+    """Дозволяє надсилати сповіщення про тривогу та відбій лише у денний робочий час (05:00–23:00)."""
+    return 5 <= now.hour < 23
+
+
 # --- Моніторинг змін руху з каналу @eway_frankivsk ---
 REROUTE_KEYWORDS = (
     "змінено рух",
@@ -1323,6 +1328,7 @@ async def delete_sub(callback: types.CallbackQuery):
 async def check_schedules():
     global last_all_clear_time, last_effective_alarm_state, was_real_alarm
     now = datetime.now(KYIV_TZ)
+    can_notify_alarm = is_alarm_notification_allowed(now)
 
     # Перевіряємо чи є зараз реальна тривога через API та враховуємо ручний режим
     api_alarm = check_ivano_frankivsk_alarm()
@@ -1336,7 +1342,7 @@ async def check_schedules():
         current_alarm_state = user_alarm_status.get(user_id, False)
 
         if is_alarm:
-            if not current_alarm_state:
+            if not current_alarm_state and can_notify_alarm:
                 user_alarm_status[user_id] = True
                 try:
                     alarm_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1355,7 +1361,7 @@ async def check_schedules():
                     logging.error(f"Не вдалося надіслати сповіщення про тривогу {user_id}: {e}")
             continue
         else:
-            if current_alarm_state:
+            if current_alarm_state and can_notify_alarm:
                 user_alarm_status[user_id] = False
                 if was_real_alarm:
                     last_all_clear_time = now
