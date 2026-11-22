@@ -1170,7 +1170,7 @@ async def ask_custom_time(callback: types.CallbackQuery, state: FSMContext):
 
 
 def add_subscription(user_id, prefix, route_num, dir_id, stop_idx, remind_before):
-    """Зберігає підписку та повертає текст підтвердження."""
+    """Зберігає підписку (або оновлює існуючу для тієї ж зупинки) та повертає текст підтвердження."""
     dict_key = route_num if prefix == "t" else f"bus_{route_num}"
     direction = schedules[dict_key][int(dir_id)]
     stop = direction["stops"][int(stop_idx)]
@@ -1179,14 +1179,29 @@ def add_subscription(user_id, prefix, route_num, dir_id, stop_idx, remind_before
     time_info_str = f"🕒 Найближчий рейс: о **{next_time}** (через ~{diff_min} хв)" if isinstance(diff_min, int) else f"🕒 Найближчий рейс: {next_time}"
 
     user_subs = subscriptions.setdefault(user_id, [])
-    user_subs.append({
-        "prefix": prefix,
-        "route": route_num,
-        "dir_id": dir_id,
-        "stop_idx": int(stop_idx),
-        "remind_before": int(remind_before),
-        "active": True,
-    })
+    existing_idx = None
+    for idx, item in enumerate(user_subs):
+        if (
+            str(item.get("prefix", "t")) == str(prefix)
+            and str(item.get("route")) == str(route_num)
+            and str(item.get("dir_id")) == str(dir_id)
+            and int(item.get("stop_idx", -1)) == int(stop_idx)
+        ):
+            existing_idx = idx
+            break
+
+    if existing_idx is not None:
+        user_subs[existing_idx]["remind_before"] = int(remind_before)
+        user_subs[existing_idx]["active"] = True
+    else:
+        user_subs.append({
+            "prefix": prefix,
+            "route": route_num,
+            "dir_id": dir_id,
+            "stop_idx": int(stop_idx),
+            "remind_before": int(remind_before),
+            "active": True,
+        })
     storage.save_subscriptions(subscriptions)
 
     icon = "🚎" if prefix == "t" else "🚌"
@@ -1207,48 +1222,135 @@ async def save_subscription(callback: types.CallbackQuery):
     await callback.message.edit_text(result, parse_mode="Markdown")
 
 
-# --- Перегляд та керування збереженими зупинками ---
-def build_subscriptions_view(user_id: str):
-    """Повертає (текст, клавіатура) зі списком підписок конкретного користувача."""
+# --- Перегляд та керування збереженими зупинками (з групуванням за маршрутом) ---
+def _format_stop_live_line(sub: dict, index_label: str | None = None) -> str:
+    prefix = sub.get("prefix", "t")
+    route_num = str(sub["route"])
+    dir_id = int(sub["dir_id"])
+    stop_idx = int(sub["stop_idx"])
+
+    dict_key = route_num if prefix == "t" else f"bus_{route_num}"
+    d = schedules[dict_key][dir_id]
+    stop = d["stops"][stop_idx]
+    status = "🟢 Увімкнено" if sub.get("active", True) else "⏸ На паузі"
+
+    next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
+    live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
+
+    prefix_str = f"{index_label}. " if index_label else "• "
+    return (
+        f"{prefix_str}📍 **{stop['name']}**\n"
+        f"   ⏳ Наступний: **{live_status}**\n"
+        f"   Сповіщення: за {sub['remind_before']} хв ({status})\n\n"
+    )
+
+
+def build_subscriptions_view(user_id: str, selected_route_key: str | None = None):
+    """
+    Повертає (текст, клавіатура) зі списком підписок користувача.
+    Якщо selected_route_key не задано — кожен маршрут представлений ОДНІЄЮ кнопкою,
+    навіть якщо в ньому збережено кілька зупинок.
+    """
     user_subs = subscriptions.get(user_id, [])
     if not user_subs:
         return "У вас ще немає збережених зупинок. Натисніть «🚎 Маршрути», щоб додати.", None
 
-    text = "Ваші збережені маршрути та зупинки:\n\n"
+    # Групуємо підписки зі збереженням порядку появи маршруту та оригінальних індексів
+    grouped_routes: list[tuple[str, list[tuple[int, dict]]]] = []
+    route_positions: dict[str, int] = {}
+
+    for real_idx, sub in enumerate(user_subs):
+        r_key = _user_route_key(sub)
+        if r_key not in route_positions:
+            route_positions[r_key] = len(grouped_routes)
+            grouped_routes.append((r_key, []))
+        grouped_routes[route_positions[r_key]][1].append((real_idx, sub))
+
     buttons = []
 
-    # Загальна кнопка керування всіма сповіщеннями
+    # Якщо відкрито перегляд конкретного маршруту (наприклад, 3 зупинки маршруту №43 в одній кнопці)
+    if selected_route_key is not None:
+        matched_group = next(((rk, items) for rk, items in grouped_routes if rk == selected_route_key), None)
+        if not matched_group:
+            return build_subscriptions_view(user_id, selected_route_key=None)
+
+        r_key, indexed_items = matched_group
+        is_bus = r_key.startswith("bus_")
+        route_num = r_key.replace("bus_", "")
+        icon = "🚌" if is_bus else "🚎"
+        transport_word = "Автобус" if is_bus else "Тролейбус"
+
+        text = f"{icon} **{transport_word} №{route_num}** — збережені зупинки ({len(indexed_items)}):\n\n"
+
+        for pos, (real_idx, sub) in enumerate(indexed_items, start=1):
+            text += _format_stop_live_line(sub, index_label=str(pos))
+            toggle_label = "⏸ Пауза" if sub.get("active", True) else "▶️ Увімкнути"
+            short_stop = schedules[r_key][int(sub["dir_id"])]["stops"][int(sub["stop_idx"])]["name"][:18]
+            buttons.append([
+                InlineKeyboardButton(text=f"{toggle_label} ({short_stop})", callback_data=f"toggle:{real_idx}:{r_key}"),
+                InlineKeyboardButton(text=f"🗑 Видалити ({short_stop})", callback_data=f"del:{real_idx}:{r_key}"),
+            ])
+
+        buttons.append([
+            InlineKeyboardButton(text="⬅️ Усі збережені маршрути", callback_data="fav_back")
+        ])
+        buttons.extend([
+            [
+                InlineKeyboardButton(text="🗺 DozoR (Карта)", url="https://city.dozor.tech/ua/iv-frankivsk/city"),
+                InlineKeyboardButton(text="🚍 EasyWay", url="https://www.eway.in.ua/ua/cities/frankivsk")
+            ],
+            [
+                InlineKeyboardButton(text="🚨 Мапа тривог", url="https://map.ukrainealarm.com/")
+            ]
+        ])
+        return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    # Загальний вигляд: одна кнопка на кожен маршрут
+    text = "Ваші збережені маршрути та зупинки:\n\n"
+
     any_active = any(sub.get("active", True) for sub in user_subs)
     if any_active:
         buttons.append([InlineKeyboardButton(text="⏸ Вимкнути всі сповіщення", callback_data="toggle:all")])
     else:
         buttons.append([InlineKeyboardButton(text="▶️ Увімкнути всі сповіщення", callback_data="toggle:all")])
 
-    for idx, sub in enumerate(user_subs):
-        prefix = sub.get("prefix", "t")
-        route_num = str(sub["route"])
-        dir_id = int(sub["dir_id"])
-        stop_idx = int(sub["stop_idx"])
+    route_row = []
+    for route_idx, (r_key, indexed_items) in enumerate(grouped_routes, start=1):
+        is_bus = r_key.startswith("bus_")
+        route_num = r_key.replace("bus_", "")
+        icon = "🚌" if is_bus else "🚎"
+        stop_count = len(indexed_items)
 
-        dict_key = route_num if prefix == "t" else f"bus_{route_num}"
-        d = schedules[dict_key][dir_id]
-        stop = d["stops"][stop_idx]
-        status = "🟢 Увімкнено" if sub.get("active", True) else "⏸ На паузі"
-        icon = "🚎" if prefix == "t" else "🚌"
+        stop_names_preview = []
+        active_stops_count = 0
+        nearest_lines = []
 
-        next_time, diff_min = get_next_arrival_info(dict_key, dir_id, stop_idx)
-        live_status = f"прибуде о {next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
+        for _, sub in indexed_items:
+            if sub.get("active", True):
+                active_stops_count += 1
+            st_name = schedules[r_key][int(sub["dir_id"])]["stops"][int(sub["stop_idx"])]["name"]
+            if st_name not in stop_names_preview:
+                stop_names_preview.append(st_name)
+            next_time, diff_min = get_next_arrival_info(r_key, int(sub["dir_id"]), int(sub["stop_idx"]))
+            live_str = f"{next_time} (через {diff_min} хв)" if isinstance(diff_min, int) else f"{next_time}"
+            nearest_lines.append(f"   • {st_name}: **{live_str}**")
+
+        count_badge = f" ({stop_count} зуп.)" if stop_count > 1 else ""
+        state_badge = "🟢" if active_stops_count > 0 else "⏸"
 
         text += (
-            f"{idx + 1}. {icon} Маршрут №{route_num} — {stop['name']}\n"
-            f"   ⏳ Наступний: **{live_status}**\n"
-            f"   Сповіщення: за {sub['remind_before']} хв ({status})\n\n"
+            f"{route_idx}. {icon} **Маршрут №{route_num}**{count_badge} — {state_badge}\n"
+            f"{''.join(nearest_lines)}\n\n"
         )
-        toggle_label = "⏸ Пауза" if sub.get("active", True) else "▶️ Увімкнути"
-        buttons.append([
-            InlineKeyboardButton(text=f"{toggle_label} {icon} №{route_num}", callback_data=f"toggle:{idx}"),
-            InlineKeyboardButton(text=f"🗑 Видалити {icon} №{route_num}", callback_data=f"del:{idx}"),
-        ])
+
+        btn_label = f"{icon} №{route_num} ({stop_count} зуп.)" if stop_count > 1 else f"{icon} №{route_num}"
+        route_row.append(InlineKeyboardButton(text=btn_label, callback_data=f"fav_route:{r_key}"))
+        if len(route_row) == 2:
+            buttons.append(route_row)
+            route_row = []
+
+    if route_row:
+        buttons.append(route_row)
 
     buttons.extend([
         [
@@ -1262,10 +1364,15 @@ def build_subscriptions_view(user_id: str):
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def show_subscriptions(user_id: str, message: types.Message, edit: bool = False):
+async def show_subscriptions(
+    user_id: str,
+    message: types.Message,
+    edit: bool = False,
+    selected_route_key: str | None = None,
+):
     """user_id передаємо окремо: у callback.message відправник — це сам бот, а не користувач."""
     try:
-        text, kb = build_subscriptions_view(user_id)
+        text, kb = build_subscriptions_view(user_id, selected_route_key=selected_route_key)
         if edit:
             await message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
         else:
@@ -1286,9 +1393,26 @@ async def my_subscriptions(message: types.Message, state: FSMContext):
     await show_subscriptions(str(message.from_user.id), message)
 
 
+@dp.callback_query(F.data.startswith("fav_route:"))
+async def open_favorite_route(callback: types.CallbackQuery):
+    r_key = callback.data.split(":", 1)[1]
+    user_id = str(callback.from_user.id)
+    await callback.answer()
+    await show_subscriptions(user_id, callback.message, edit=True, selected_route_key=r_key)
+
+
+@dp.callback_query(F.data == "fav_back")
+async def back_to_favorite_routes(callback: types.CallbackQuery):
+    user_id = str(callback.from_user.id)
+    await callback.answer()
+    await show_subscriptions(user_id, callback.message, edit=True, selected_route_key=None)
+
+
 @dp.callback_query(F.data.startswith("toggle:"))
 async def toggle_sub(callback: types.CallbackQuery):
-    target = callback.data.split(":")[1]
+    parts = callback.data.split(":")
+    target = parts[1]
+    return_route_key = parts[2] if len(parts) > 2 else None
     user_id = str(callback.from_user.id)
 
     if user_id not in subscriptions or not subscriptions[user_id]:
@@ -1310,18 +1434,28 @@ async def toggle_sub(callback: types.CallbackQuery):
             storage.save_subscriptions(subscriptions)
         await callback.answer("Статус змінено!")
 
-    await show_subscriptions(user_id, callback.message, edit=True)
+    await show_subscriptions(user_id, callback.message, edit=True, selected_route_key=return_route_key)
 
 
 @dp.callback_query(F.data.startswith("del:"))
 async def delete_sub(callback: types.CallbackQuery):
-    idx = int(callback.data.split(":")[1])
+    parts = callback.data.split(":")
+    idx = int(parts[1])
+    return_route_key = parts[2] if len(parts) > 2 else None
     user_id = str(callback.from_user.id)
+
     if user_id in subscriptions and idx < len(subscriptions[user_id]):
         subscriptions[user_id].pop(idx)
         storage.save_subscriptions(subscriptions)
+
+    # Якщо в обраному маршруті більше не залишилось зупинок — повертаємось до загального списку маршрутів
+    if return_route_key:
+        remaining = [s for s in subscriptions.get(user_id, []) if _user_route_key(s) == return_route_key]
+        if not remaining:
+            return_route_key = None
+
     await callback.answer("Видалено!")
-    await show_subscriptions(user_id, callback.message, edit=True)
+    await show_subscriptions(user_id, callback.message, edit=True, selected_route_key=return_route_key)
 
 
 # --- Фонова перевірка розкладу щохвилини (з урахуванням тривоги та відбою) ---
