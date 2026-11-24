@@ -348,7 +348,7 @@ async def send_admin_feedback_history(target_message: types.Message):
     indexed_recent = list(enumerate(feedbacks))[-10:]
     indexed_recent.reverse()
 
-    lines = [f"💬 **Історія відгуків** (всього: **{len(feedbacks)}**, показані останні {len(indexed_recent)}):\n"]
+    lines = [f"💬 Історія відгуків (всього: {len(feedbacks)}, показані останні {len(indexed_recent)}):\n"]
     buttons = []
 
     for real_idx, item in indexed_recent:
@@ -359,14 +359,14 @@ async def send_admin_feedback_history(target_message: types.Message):
         text = item.get("text", "")
 
         if username:
-            who = f"@{username} (`{uid}`)"
+            who = f"@{username} ({uid})"
         elif full_name:
-            who = f"{full_name} (`{uid}`)"
+            who = f"{full_name} ({uid})"
         else:
-            who = f"`{uid}`"
+            who = f"{uid}"
 
         lines.append(
-            f"**#{real_idx + 1}** | 🕒 {created_at}\n"
+            f"#{real_idx + 1} | 🕒 {created_at}\n"
             f"👤 Від: {who}\n"
             f"📝 {text}\n"
         )
@@ -382,7 +382,8 @@ async def send_admin_feedback_history(target_message: types.Message):
             ])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    await target_message.answer("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
+    full_text = "\n".join(lines)[:4000]
+    await target_message.answer(full_text, reply_markup=kb)
 
 
 @dp.message(Command("feedbacks"))
